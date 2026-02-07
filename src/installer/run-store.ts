@@ -47,3 +47,6 @@ export async function findRunByTaskTitle(taskTitle: string): Promise<WorkflowRun
   const match = runs.find((run) => normalizeTitle(run.taskTitle) === normalized);
   return match ?? null;
 }
+
+// Alias for step-runner compatibility
+export const readWorkflowRun = findRunByTaskTitle;

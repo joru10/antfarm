@@ -4,6 +4,7 @@ import { uninstallAllWorkflows, uninstallWorkflow } from "../installer/uninstall
 import { updateWorkflow } from "../installer/update.js";
 import { getWorkflowStatus } from "../installer/status.js";
 import { runWorkflow } from "../installer/run.js";
+import { getNextStep, completeStep } from "../installer/step-runner.js";
 
 function printUsage() {
   process.stdout.write(
@@ -14,6 +15,8 @@ function printUsage() {
       "antfarm workflow uninstall --all",
       "antfarm workflow status <task-title>",
       "antfarm workflow run <workflow-id> <task-title>",
+      "antfarm workflow next <task-title>",
+      "antfarm workflow complete <task-title> <success|fail> [output]",
     ].join("\n") + "\n",
   );
 }
@@ -91,6 +94,20 @@ async function main() {
         `Lead Session: ${run.leadSessionLabel}`,
       ].join("\n") + "\n",
     );
+    return;
+  }
+
+  if (action === "next") {
+    const result = await getNextStep(target);
+    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    return;
+  }
+
+  if (action === "complete") {
+    const success = args[3] === "success";
+    const output = args.slice(4).join(" ").trim() || "";
+    const result = await completeStep({ taskTitle: target, output, success });
+    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
     return;
   }
 

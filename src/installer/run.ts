@@ -31,6 +31,11 @@ export async function runWorkflow(params: {
     status: "running",
     leadAgentId: `${workflow.id}/${leadAgentId}`,
     leadSessionLabel,
+    currentStepIndex: 0,
+    currentStepId: workflow.steps[0]?.id,
+    stepResults: [],
+    retryCount: 0,
+    context: { task: params.taskTitle },
     createdAt: now,
     updatedAt: now,
   };

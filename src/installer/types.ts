@@ -40,6 +40,14 @@ export type WorkflowInstallResult = {
   workflowDir: string;
 };
 
+export type StepResult = {
+  stepId: string;
+  agentId: string;
+  output: string;
+  status: "done" | "retry" | "blocked";
+  completedAt: string;
+};
+
 export type WorkflowRunRecord = {
   id: string;
   workflowId: string;
@@ -48,6 +56,11 @@ export type WorkflowRunRecord = {
   status: "running" | "paused" | "blocked" | "completed" | "canceled";
   leadAgentId: string;
   leadSessionLabel: string;
+  currentStepIndex: number;
+  currentStepId?: string;
+  stepResults: StepResult[];
+  retryCount: number;
+  context: Record<string, string>;
   createdAt: string;
   updatedAt: string;
 };
