@@ -32,6 +32,19 @@ const AGENTS_BLOCK = `${WORKFLOW_BLOCK_START}
 - If a workflow is blocked, communicate the exact blocker and next step.
 
 If the user requests a workflow change, relay it to the workflow lead.
+
+## Workflow Orchestration (Auto-Advance)
+
+When you receive an announce from a workflow agent (label starts with "wf-"):
+1. Run: \`antfarm daemon once\` to detect completion and queue next spawn
+2. Check spawn queue: \`antfarm daemon queue\`
+3. For each pending request, spawn the agent:
+   \`\`\`
+   sessions_spawn(agentId, task, label)  // from the spawn request
+   \`\`\`
+4. After spawning, dequeue: \`antfarm daemon dequeue <filename>\`
+
+This keeps workflows advancing automatically without manual intervention.
 ${WORKFLOW_BLOCK_END}
 `;
 
