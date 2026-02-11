@@ -4,6 +4,39 @@ Task: Smoke test run from container with gateway port override
 Started: Wednesday, February 11th, 2026 — 8:23 AM (UTC)
 
 ## Codebase Patterns
-(add patterns here as you discover them)
+
+- This project uses ES2022 with NodeNext module resolution
+- TypeScript compiles src/ to dist/; tests/ need separate tsconfig.tests.json
+- Tests run directly with `node --experimental-strip-types`
+- Tests import from ../dist/ for compiled sources (no type declarations available)
+- For new test files, import from .ts with `allowImportingTsExtensions` enabled
+- Build cmd: `npm run build`
+- Test cmd: `node --experimental-strip-types tests/<test-file>.ts`
+- The project is a CLI tool installed as `antfarm` command
+
+---
+
+## 2026-02-11 08:35 UTC - US-001: Create container-aware test runner script
+- What was implemented:
+  - Created tests/run-smoke-tests.ts as container-aware test entry point
+  - Detects container env via /.dockerenv, env vars (KUBERNETES_SERVICE_HOST, CONTAINER_ID, etc.), and /proc/self/cgroup
+  - Validates OPENCLAW_GATEWAY_PORT with range checks (1-65535)
+  - Discovers and runs *.smoke.test.ts files
+  - Aggregates results with exit codes (0=pass, 1=fail) and timing info
+  - Created tests/run-smoke-tests.test.ts for test coverage
+  - Added tsconfig.tests.json for test type checking
+
+- Files changed:
+  - tests/run-smoke-tests.ts (new, executable)
+  - tests/run-smoke-tests.test.ts (new)
+  - tsconfig.tests.json (new)
+  - progress.txt (new)
+
+- **Learnings:**
+  - Project uses ES modules with NodeNext resolution
+  - Tests can run directly with `node --experimental-strip-types`
+  - For typechecking tests, use a separate tsconfig with `allowImportingTsExtensions: true`
+  - Existing tests import from ../dist/ but that loses type safety
+  - New pattern: import from .ts files in tests with proper tsconfig
 
 ---
