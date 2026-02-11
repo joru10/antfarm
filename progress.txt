@@ -1,0 +1,9 @@
+# Progress Log
+Run: b9b0e1a5-02a4-4dce-a78a-4a8ea6108a0f
+Task: Smoke test run from container with gateway port override
+Started: Wednesday, February 11th, 2026 — 8:23 AM (UTC)
+
+## Codebase Patterns
+(add patterns here as you discover them)
+
+---
