@@ -302,6 +302,7 @@ export function claimStep(agentId: string): ClaimResult {
      JOIN runs r ON r.id = s.run_id
      WHERE s.agent_id = ? AND s.status = 'pending'
        AND r.status NOT IN ('failed', 'cancelled')
+     ORDER BY r.created_at ASC, s.step_index ASC
      LIMIT 1`
   ).get(agentId) as { id: string; run_id: string; input_template: string; type: string; loop_config: string | null } | undefined;
 

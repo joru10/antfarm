@@ -25,7 +25,9 @@ import { getRecentEvents, getRunEvents, type AntfarmEvent } from "../installer/e
 import { startDaemon, stopDaemon, getDaemonStatus, isRunning } from "../server/daemonctl.js";
 import { claimStep, completeStep, failStep, getStories } from "../installer/step-ops.js";
 import { ensureCliSymlink } from "../installer/symlink.js";
-import { execSync } from "node:child_process";
+import { getDb } from "../db.js";
+import { listCronJobs } from "../installer/gateway-api.js";
+import { execFileSync, execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -91,7 +93,7 @@ function printUsage() {
       "antfarm workflow install <name>      Install a workflow",
       "antfarm workflow uninstall <name>    Uninstall a workflow (blocked if runs active)",
       "antfarm workflow uninstall --all     Uninstall all workflows (--force to override)",
-      "antfarm workflow run <name> <task>   Start a workflow run",
+      "antfarm workflow run <name> <task>   Start a workflow run (--allow-concurrent to queue)",
       "antfarm workflow status <query>      Check run status (task substring, run ID prefix)",
       "antfarm workflow runs                List all workflow runs",
       "antfarm workflow resume <run-id>     Resume a failed run from where it left off",
@@ -104,6 +106,8 @@ function printUsage() {
       "antfarm step complete <step-id>      Complete step (reads output from stdin)",
       "antfarm step fail <step-id> <error>  Fail step with retry logic",
       "antfarm step stories <run-id>       List stories for a run",
+      "",
+      "antfarm probe <agent-id>             Show scheduler + queue readiness for one agent",
       "",
       "antfarm logs [<lines>]               Show recent activity (from events)",
       "antfarm logs <run-id>                Show activity for a specific run",
@@ -327,6 +331,158 @@ async function main() {
     return;
   }
 
+  if (group === "probe") {
+    const agentId = args[1];
+    const asJson = args.includes("--json");
+    if (!agentId) {
+      process.stderr.write("Missing agent-id.\n");
+      process.exit(1);
+    }
+
+    const db = getDb();
+    const pendingRows = db.prepare(
+      `SELECT s.run_id as runId, s.step_id as stepId, r.created_at as runCreatedAt, r.task as task
+       FROM steps s
+       JOIN runs r ON r.id = s.run_id
+       WHERE s.agent_id = ? AND s.status = 'pending' AND r.status = 'running'
+       ORDER BY r.created_at ASC, s.step_index ASC`
+    ).all(agentId) as Array<{ runId: string; stepId: string; runCreatedAt: string; task: string }>;
+
+    const runningRows = db.prepare(
+      `SELECT s.run_id as runId, s.step_id as stepId, r.created_at as runCreatedAt
+       FROM steps s
+       JOIN runs r ON r.id = s.run_id
+       WHERE s.agent_id = ? AND s.status = 'running' AND r.status = 'running'
+       ORDER BY r.created_at ASC, s.step_index ASC`
+    ).all(agentId) as Array<{ runId: string; stepId: string; runCreatedAt: string }>;
+
+    const workflowPrefix = agentId.includes("/") ? `antfarm/${agentId}` : `antfarm/${agentId}`;
+    let cron: {
+      found: boolean;
+      enabled?: boolean;
+      name?: string;
+      id?: string;
+      nextRunAt?: string;
+      lastRunAt?: string;
+      lastStatus?: string;
+      lastError?: string;
+      error?: string;
+    } = { found: false };
+
+    try {
+      const cronResult = await listCronJobs();
+      if (cronResult.ok && cronResult.jobs) {
+        const matched = cronResult.jobs.find((job) => job.name === workflowPrefix);
+        if (matched) {
+          const job = matched as any;
+          cron = {
+            found: true,
+            enabled: Boolean(job.enabled),
+            name: job.name,
+            id: job.id,
+            nextRunAt: typeof job.state?.nextRunAtMs === "number" ? new Date(job.state.nextRunAtMs).toISOString() : undefined,
+            lastRunAt: typeof job.state?.lastRunAtMs === "number" ? new Date(job.state.lastRunAtMs).toISOString() : undefined,
+            lastStatus: typeof job.state?.lastStatus === "string" ? job.state.lastStatus : undefined,
+            lastError: typeof job.state?.lastError === "string" ? job.state.lastError : undefined,
+          };
+        }
+      } else {
+        cron = { found: false, error: cronResult.error ?? "cron list failed" };
+      }
+    } catch (err) {
+      cron = { found: false, error: err instanceof Error ? err.message : String(err) };
+    }
+
+    // Probe fallback: direct OpenClaw CLI read for full cron state (helps when /tools/invoke list is partial).
+    if (!cron.found) {
+      try {
+        const raw = execFileSync(
+          "node",
+          ["/app/dist/index.js", "cron", "list", "--json"],
+          { encoding: "utf8", env: { ...process.env, OPENCLAW_GATEWAY_PORT: process.env.OPENCLAW_GATEWAY_PORT ?? "18789" } },
+        );
+        const parsed = JSON.parse(raw);
+        const jobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
+        const job = jobs.find((entry: any) => entry?.name === workflowPrefix);
+        if (job) {
+          cron = {
+            found: true,
+            enabled: Boolean(job.enabled),
+            name: job.name,
+            id: job.id,
+            nextRunAt: typeof job.state?.nextRunAtMs === "number" ? new Date(job.state.nextRunAtMs).toISOString() : undefined,
+            lastRunAt: typeof job.state?.lastRunAtMs === "number" ? new Date(job.state.lastRunAtMs).toISOString() : undefined,
+            lastStatus: typeof job.state?.lastStatus === "string" ? job.state.lastStatus : undefined,
+            lastError: typeof job.state?.lastError === "string" ? job.state.lastError : undefined,
+          };
+        }
+      } catch {
+        // Keep existing scheduler error state.
+      }
+    }
+
+    const report = {
+      agentId,
+      timestamp: new Date().toISOString(),
+      claimableNow: pendingRows.length > 0,
+      queueDepth: pendingRows.length,
+      runningCount: runningRows.length,
+      oldestPending: pendingRows[0]
+        ? {
+            runId: pendingRows[0].runId,
+            stepId: pendingRows[0].stepId,
+            runCreatedAt: pendingRows[0].runCreatedAt,
+            taskPreview: pendingRows[0].task.slice(0, 120),
+            aheadInQueue: 0,
+          }
+        : null,
+      upcomingQueue: pendingRows.slice(0, 10).map((row, index) => ({
+        queuePos: index + 1,
+        runId: row.runId,
+        stepId: row.stepId,
+        runCreatedAt: row.runCreatedAt,
+        taskPreview: row.task.slice(0, 120),
+      })),
+      scheduler: cron,
+    };
+
+    if (asJson) {
+      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+      return;
+    }
+
+    const lines = [
+      `Agent: ${report.agentId}`,
+      `Time: ${report.timestamp}`,
+      `Claimable now: ${report.claimableNow ? "yes" : "no"}`,
+      `Queue depth: ${report.queueDepth}`,
+      `Currently running steps: ${report.runningCount}`,
+      "",
+      "Scheduler:",
+      `  Found: ${report.scheduler.found ? "yes" : "no"}`,
+      `  Name: ${report.scheduler.name ?? "-"}`,
+      `  Enabled: ${report.scheduler.enabled === undefined ? "-" : report.scheduler.enabled ? "yes" : "no"}`,
+      `  Next wake: ${report.scheduler.nextRunAt ?? "-"}`,
+      `  Last run: ${report.scheduler.lastRunAt ?? "-"}`,
+      `  Last status: ${report.scheduler.lastStatus ?? "-"}`,
+      `  Last error: ${report.scheduler.lastError ?? report.scheduler.error ?? "-"}`,
+      "",
+      "Queue (oldest first):",
+    ];
+    if (report.upcomingQueue.length === 0) {
+      lines.push("  (empty)");
+    } else {
+      for (const item of report.upcomingQueue) {
+        lines.push(`  #${item.queuePos} ${item.runId.slice(0, 8)} ${item.stepId} ${item.runCreatedAt} ${item.taskPreview}`);
+      }
+      if (report.queueDepth > report.upcomingQueue.length) {
+        lines.push(`  ... +${report.queueDepth - report.upcomingQueue.length} more`);
+      }
+    }
+    process.stdout.write(lines.join("\n") + "\n");
+    return;
+  }
+
   if (args.length < 2) { printUsage(); process.exit(1); }
   if (group !== "workflow") { printUsage(); process.exit(1); }
 
@@ -513,15 +669,21 @@ async function main() {
 
   if (action === "run") {
     let notifyUrl: string | undefined;
+    let allowConcurrent = false;
     const runArgs = args.slice(3);
     const nuIdx = runArgs.indexOf("--notify-url");
     if (nuIdx !== -1) {
       notifyUrl = runArgs[nuIdx + 1];
       runArgs.splice(nuIdx, 2);
     }
+    const acIdx = runArgs.indexOf("--allow-concurrent");
+    if (acIdx !== -1) {
+      allowConcurrent = true;
+      runArgs.splice(acIdx, 1);
+    }
     const taskTitle = runArgs.join(" ").trim();
     if (!taskTitle) { process.stderr.write("Missing task title.\n"); printUsage(); process.exit(1); }
-    const run = await runWorkflow({ workflowId: target, taskTitle, notifyUrl });
+    const run = await runWorkflow({ workflowId: target, taskTitle, notifyUrl, allowConcurrent });
     process.stdout.write(
       [`Run: ${run.id}`, `Workflow: ${run.workflowId}`, `Task: ${run.task}`, `Status: ${run.status}`].join("\n") + "\n",
     );

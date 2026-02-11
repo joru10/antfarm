@@ -1,6 +1,6 @@
 ---
 name: antfarm-workflows
-description: "Multi-agent workflow orchestration for OpenClaw. Use when user mentions antfarm, asks to run a multi-step workflow (feature dev, bug fix, security audit), or wants to install/uninstall/check status of antfarm workflows."
+description: "Multi-agent workflow orchestration for OpenClaw. Use when user mentions antfarm, asks to run a multi-step workflow (feature dev, bug fix, security audit, deep research), or wants to install/uninstall/check status of antfarm workflows."
 user-invocable: false
 ---
 
@@ -23,6 +23,7 @@ Shorthand used below: `antfarm-cli` means `node ~/.openclaw/workspace/antfarm/di
 | `feature-dev` | plan -> setup -> develop (stories) -> verify -> test -> PR -> review | New features, refactors |
 | `bug-fix` | triage -> investigate -> setup -> fix -> verify -> PR | Bug reports with reproduction steps |
 | `security-audit` | scan -> prioritize -> setup -> fix -> verify -> test -> PR | Codebase security review |
+| `deep-research` | plan -> research (lanes) -> validate -> synthesize -> edit | Multi-source research briefs with evidence quality gates |
 
 ## Core Commands
 
@@ -85,6 +86,12 @@ node ~/.openclaw/workspace/antfarm/dist/cli/cli.js workflow list
 node ~/.openclaw/workspace/antfarm/dist/cli/cli.js workflow install <name>
 node ~/.openclaw/workspace/antfarm/dist/cli/cli.js workflow uninstall <name>
 node ~/.openclaw/workspace/antfarm/dist/cli/cli.js workflow uninstall --all [--force]
+```
+
+For containerized gateway setups that expose OpenClaw on a forwarded host port, run with:
+
+```bash
+OPENCLAW_GATEWAY_PORT=18789 node ~/.openclaw/workspace/antfarm/dist/cli/cli.js workflow run deep-research "<topic and output requirements>"
 ```
 
 ## Creating Custom Workflows

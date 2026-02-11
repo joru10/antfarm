@@ -1,0 +1,287 @@
+# Ralph loop (https://github.com/snarktank/ralph) — fresh context per agent session
+id: deep-research
+name: Deep Research Workflow
+version: 1
+description: |
+  Structured deep-research pipeline for non-coding investigations.
+  Planner decomposes the topic into research lanes. Researcher gathers evidence per lane.
+  Validator pressure-tests evidence quality and source credibility. Synthesizer drafts the report.
+  Editor produces final publication-ready output with citations and confidence notes.
+
+cron:
+  interval_ms: 60000
+
+agents:
+  - id: planner
+    name: Research Planner
+    role: analysis
+    description: Decomposes a broad prompt into focused research lanes.
+    workspace:
+      baseDir: agents/planner
+      files:
+        AGENTS.md: agents/planner/AGENTS.md
+        SOUL.md: agents/planner/SOUL.md
+        IDENTITY.md: agents/planner/IDENTITY.md
+
+  - id: researcher
+    name: Researcher
+    role: scanning
+    description: Collects evidence from credible sources for each lane.
+    workspace:
+      baseDir: agents/researcher
+      files:
+        AGENTS.md: agents/researcher/AGENTS.md
+        SOUL.md: agents/researcher/SOUL.md
+        IDENTITY.md: agents/researcher/IDENTITY.md
+
+  - id: validator
+    name: Evidence Validator
+    role: scanning
+    description: Verifies source quality, claim traceability, and confidence.
+    workspace:
+      baseDir: agents/validator
+      files:
+        AGENTS.md: agents/validator/AGENTS.md
+        SOUL.md: agents/validator/SOUL.md
+        IDENTITY.md: agents/validator/IDENTITY.md
+
+  - id: synthesizer
+    name: Synthesizer
+    role: analysis
+    description: Produces a full draft from validated research artifacts.
+    workspace:
+      baseDir: agents/synthesizer
+      files:
+        AGENTS.md: agents/synthesizer/AGENTS.md
+        SOUL.md: agents/synthesizer/SOUL.md
+        IDENTITY.md: agents/synthesizer/IDENTITY.md
+
+  - id: editor
+    name: Editor
+    role: analysis
+    description: Final editorial pass for clarity, structure, and actionability.
+    workspace:
+      baseDir: agents/editor
+      files:
+        AGENTS.md: agents/editor/AGENTS.md
+        SOUL.md: agents/editor/SOUL.md
+        IDENTITY.md: agents/editor/IDENTITY.md
+
+steps:
+  - id: plan
+    agent: planner
+    input: |
+      Plan a deep-research investigation.
+
+      EXECUTION PROTOCOL (STRICT):
+      - This is assigned workflow work, not a chat.
+      - Do not ask questions back to the user.
+      - Do not output greetings/acknowledgements (e.g., "Ready", "How can I help?", "HEARTBEAT_OK").
+      - Output only contract fields; first line must be `STATUS: done`.
+
+      TASK:
+      {{task}}
+
+      Instructions:
+      1. Clarify the research objective and success criteria from the task
+      2. Split into 4-8 focused research lanes (max 8)
+      3. Order lanes by dependency (background before comparative analysis)
+      4. Each lane must be completable in one researcher session
+      5. Include explicit source quality criteria in each lane
+
+      Stories must use this schema:
+      - id: "R-001", ...
+      - title: short lane title
+      - description: what to investigate, key sub-questions, recommended sources
+      - acceptanceCriteria: must include:
+        - "At least 2 independent sources"
+        - "Publication date recorded for each source"
+        - "Confidence and open questions documented"
+
+      Reply with:
+      STATUS: done
+      REPORT_TITLE: <title for final brief>
+      RESEARCH_SCOPE: <1 line scope statement>
+      STORIES_JSON: [ ... array of lane stories ... ]
+    expects: "STATUS: done"
+    max_retries: 2
+    on_fail:
+      escalate_to: human
+
+  - id: research
+    agent: researcher
+    type: loop
+    loop:
+      over: stories
+      completion: all_done
+      fresh_session: true
+      verify_each: true
+      verify_step: validate
+    input: |
+      Execute one deep-research lane. Work only on the current lane.
+
+      EXECUTION PROTOCOL (STRICT):
+      - This is assigned workflow work, not a chat.
+      - Do not ask questions back to the user.
+      - Do not output greetings/acknowledgements (e.g., "Ready", "How can I help?", "HEARTBEAT_OK").
+      - Output only contract fields; first line must be `STATUS: done`.
+
+      TASK (overall):
+      {{task}}
+
+      REPORT_TITLE: {{report_title}}
+      RESEARCH_SCOPE: {{research_scope}}
+      CURRENT LANE:
+      {{current_story}}
+
+      COMPLETED LANES:
+      {{completed_stories}}
+      LANES REMAINING: {{stories_remaining}}
+
+      VERIFY FEEDBACK (if retrying):
+      {{verify_feedback}}
+
+      PROGRESS LOG:
+      {{progress}}
+
+      Requirements:
+      1. Use web_search/web_fetch to collect evidence from credible sources
+      2. Capture at least 2 independent domains (3 preferred)
+      3. Record publisher + URL + publication date for every source
+      4. Distinguish facts vs inference
+      5. Note unresolved contradictions or data gaps
+      6. Append lane notes to progress.txt in your workspace
+
+      Output format (strict):
+      STATUS: done
+      CHANGES: <what you investigated>
+      SOURCE_COUNT: <number>
+      EVIDENCE_JSON: {"lane_id":"R-001","key_findings":[{"claim":"...","confidence":"high|medium|low","sources":["https://...","https://..."]}],"sources":[{"url":"https://...","publisher":"...","published":"YYYY-MM-DD"}],"open_questions":["..."]}
+    expects: "STATUS: done"
+    max_retries: 2
+    on_fail:
+      escalate_to: human
+
+  - id: validate
+    agent: validator
+    input: |
+      Validate the latest research lane output.
+
+      EXECUTION PROTOCOL (STRICT):
+      - This is assigned workflow work, not a chat.
+      - Do not ask questions back to the user.
+      - Do not output greetings/acknowledgements (e.g., "Ready", "How can I help?", "HEARTBEAT_OK").
+      - Output only contract fields; first line must be `STATUS: done` or `STATUS: retry`.
+
+      TASK:
+      {{task}}
+
+      CURRENT LANE:
+      {{current_story}}
+      CHANGES: {{changes}}
+      SOURCE_COUNT: {{source_count}}
+      EVIDENCE_JSON: {{evidence_json}}
+
+      PROGRESS LOG:
+      {{progress}}
+
+      Validation checks:
+      1. EVIDENCE_JSON is valid and non-empty
+      2. At least 2 independent source domains are present
+      3. Every source includes publication date
+      4. Major claims are traceable to cited URLs
+      5. Confidence levels are coherent with evidence quality
+      6. Open questions are explicit when evidence is weak
+
+      If valid:
+      STATUS: done
+      VERIFIED: <what passed and why>
+
+      If insufficient:
+      STATUS: retry
+      ISSUES:
+      - <missing/weak evidence issue 1>
+      - <missing/weak evidence issue 2>
+    expects: "STATUS: done"
+    on_fail:
+      retry_step: research
+      max_retries: 2
+      on_exhausted:
+        escalate_to: human
+
+  - id: synthesize
+    agent: synthesizer
+    input: |
+      Create the first complete draft of the research brief.
+
+      EXECUTION PROTOCOL (STRICT):
+      - This is assigned workflow work, not a chat.
+      - Do not ask questions back to the user.
+      - Do not output greetings/acknowledgements (e.g., "Ready", "How can I help?", "HEARTBEAT_OK").
+      - Output only contract fields; first line must be `STATUS: done`.
+
+      TASK:
+      {{task}}
+
+      REPORT_TITLE: {{report_title}}
+      RESEARCH_SCOPE: {{research_scope}}
+      COMPLETED LANES:
+      {{completed_stories}}
+      PROGRESS LOG:
+      {{progress}}
+
+      Requirements:
+      1. Produce a structured report with:
+         - Executive summary
+         - Key findings
+         - Evidence table (claim -> sources -> confidence)
+         - Contradictions / uncertainty
+         - Implications and recommendations
+      2. Keep all claims source-traceable
+      3. Make confidence explicit (high/medium/low)
+      4. Write draft to /tmp/antfarm-research-draft.md
+
+      Reply with:
+      STATUS: done
+      DRAFT_PATH: /tmp/antfarm-research-draft.md
+      EXEC_SUMMARY: <3-5 lines>
+    expects: "STATUS: done"
+    max_retries: 2
+    on_fail:
+      escalate_to: human
+
+  - id: edit
+    agent: editor
+    input: |
+      Perform final editorial pass and produce the final deliverable.
+
+      EXECUTION PROTOCOL (STRICT):
+      - This is assigned workflow work, not a chat.
+      - Do not ask questions back to the user.
+      - Do not output greetings/acknowledgements (e.g., "Ready", "How can I help?", "HEARTBEAT_OK").
+      - Output only contract fields; first line must be `STATUS: done`.
+
+      TASK:
+      {{task}}
+
+      REPORT_TITLE: {{report_title}}
+      DRAFT_PATH: {{draft_path}}
+      EXEC_SUMMARY: {{exec_summary}}
+      PROGRESS LOG:
+      {{progress}}
+
+      Requirements:
+      1. Improve clarity, concision, and structure without inventing facts
+      2. Preserve citation traceability and confidence labels
+      3. Add a "What we still don't know" section
+      4. Write final report to /tmp/antfarm-research-final.md
+      5. Include next-step recommendations
+
+      Reply with:
+      STATUS: done
+      FINAL_REPORT_PATH: /tmp/antfarm-research-final.md
+      FINAL_SUMMARY: <short final summary>
+    expects: "STATUS: done"
+    max_retries: 2
+    on_fail:
+      escalate_to: human
