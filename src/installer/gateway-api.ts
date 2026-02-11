@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 
 interface GatewayConfig {
   url: string;
+  port: number;
   token?: string;
 }
 
@@ -23,10 +24,15 @@ async function readOpenClawConfig(): Promise<{ port?: number; token?: string }> 
 }
 
 async function getGatewayConfig(): Promise<GatewayConfig> {
+  const envPort = Number(process.env.OPENCLAW_GATEWAY_PORT);
   const config = await readOpenClawConfig();
-  const port = config.port ?? 18789;
+  const port =
+    Number.isFinite(envPort) && envPort > 0
+      ? envPort
+      : (config.port ?? 18789);
   return {
     url: `http://127.0.0.1:${port}`,
+    port,
     token: config.token,
   };
 }
@@ -35,11 +41,15 @@ async function getGatewayConfig(): Promise<GatewayConfig> {
 // OpenClaw CLI fallback helpers
 // ---------------------------------------------------------------------------
 
-let cachedBinary: string | null = null;
+type CliRunner =
+  | { command: string; staticArgs: string[]; env?: Record<string, string> }
+  | null;
 
-/** Locate the openclaw binary. Checks PATH, then ~/.npm-global/bin, then npx. */
-async function findOpenclawBinary(): Promise<string> {
-  if (cachedBinary) return cachedBinary;
+let cachedRunner: CliRunner = null;
+
+/** Locate an OpenClaw CLI runner. Checks PATH, common binaries, then /app/dist/index.js, then npx. */
+async function findOpenclawRunner(): Promise<Exclude<CliRunner, null>> {
+  if (cachedRunner) return cachedRunner;
 
   // 1. Check PATH via `which`
   const fromPath = await new Promise<string | null>((resolve) => {
@@ -48,7 +58,10 @@ async function findOpenclawBinary(): Promise<string> {
       else resolve(null);
     });
   });
-  if (fromPath) { cachedBinary = fromPath; return fromPath; }
+  if (fromPath) {
+    cachedRunner = { command: fromPath, staticArgs: [] };
+    return cachedRunner;
+  }
 
   // 2. Check common global install locations
   const candidates = [
@@ -59,22 +72,39 @@ async function findOpenclawBinary(): Promise<string> {
   for (const c of candidates) {
     try {
       await fs.access(c, 0o1 /* fs.constants.X_OK */);
-      cachedBinary = c;
-      return c;
+      cachedRunner = { command: c, staticArgs: [] };
+      return cachedRunner;
     } catch { /* skip */ }
   }
 
-  // 3. Fall back to npx
-  cachedBinary = "npx";
-  return "npx";
+  // 3. Use the bundled gateway CLI entrypoint inside OpenClaw gateway containers
+  try {
+    await fs.access("/app/dist/index.js", 0o1 /* fs.constants.X_OK */);
+    cachedRunner = {
+      command: "node",
+      staticArgs: ["/app/dist/index.js"],
+      env: { OPENCLAW_GATEWAY_PORT: process.env.OPENCLAW_GATEWAY_PORT ?? "18789" },
+    };
+    return cachedRunner;
+  } catch { /* skip */ }
+
+  // 4. Fall back to npx
+  cachedRunner = { command: "npx", staticArgs: ["openclaw"] };
+  return cachedRunner;
 }
 
 /** Run an openclaw CLI command and return stdout. */
 function runCli(args: string[]): Promise<string> {
   return new Promise(async (resolve, reject) => {
-    const bin = await findOpenclawBinary();
-    const finalArgs = bin === "npx" ? ["openclaw", ...args] : args;
-    execFile(bin, finalArgs, { timeout: 30_000 }, (err, stdout, stderr) => {
+    const runner = await findOpenclawRunner();
+    const finalArgs = [...runner.staticArgs, ...args];
+    const gateway = await getGatewayConfig();
+    const env = {
+      ...process.env,
+      OPENCLAW_GATEWAY_PORT: String(gateway.port),
+      ...(runner.env ?? {}),
+    };
+    execFile(runner.command, finalArgs, { timeout: 30_000, env }, (err, stdout, stderr) => {
       if (err) reject(new Error(stderr || err.message));
       else resolve(stdout);
     });
@@ -109,6 +139,8 @@ export async function createAgentCronJob(job: {
     }
 
     args.push("--session", job.sessionTarget === "isolated" ? "isolated" : "main");
+    args.push("--agent", job.agentId);
+    args.push("--no-deliver");
 
     if (job.payload?.message) {
       args.push("--message", job.payload.message);
@@ -149,7 +181,11 @@ async function createAgentCronJobHTTP(job: {
     const response = await fetch(`${gateway.url}/tools/invoke`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ tool: "cron", args: { action: "add", job }, sessionKey: "agent:main:main" }),
+      body: JSON.stringify({
+        tool: "cron",
+        args: { action: "add", job: { ...job, delivery: { mode: "none", channel: "last" } } },
+        sessionKey: "agent:main:main",
+      }),
     });
 
     if (response.status === 404) return null; // signal CLI fallback
@@ -215,7 +251,12 @@ export async function listCronJobs(): Promise<{ ok: boolean; jobs?: Array<{ id: 
 
   // --- CLI fallback ---
   try {
-    const stdout = await runCli(["cron", "list", "--json", "--all"]);
+    let stdout: string;
+    try {
+      stdout = await runCli(["cron", "list", "--json", "--all"]);
+    } catch {
+      stdout = await runCli(["cron", "list", "--json"]);
+    }
     const parsed = JSON.parse(stdout);
     const jobs: Array<{ id: string; name: string }> = parsed.jobs ?? parsed ?? [];
     return { ok: true, jobs };

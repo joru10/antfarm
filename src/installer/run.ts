@@ -10,12 +10,36 @@ export async function runWorkflow(params: {
   workflowId: string;
   taskTitle: string;
   notifyUrl?: string;
+  allowConcurrent?: boolean;
 }): Promise<{ id: string; workflowId: string; task: string; status: string }> {
   const workflowDir = resolveWorkflowDir(params.workflowId);
   const workflow = await loadWorkflowSpec(workflowDir);
   const db = getDb();
   const now = new Date().toISOString();
   const runId = crypto.randomUUID();
+
+  if (!params.allowConcurrent) {
+    const activeRun = db.prepare(
+      `SELECT r.id, r.created_at, s.step_id, s.agent_id
+       FROM runs r
+       LEFT JOIN steps s ON s.run_id = r.id AND s.status IN ('pending', 'running')
+       WHERE r.workflow_id = ? AND r.status = 'running'
+       ORDER BY r.created_at ASC
+       LIMIT 1`
+    ).get(workflow.id) as
+      | { id: string; created_at: string; step_id: string | null; agent_id: string | null }
+      | undefined;
+
+    if (activeRun) {
+      const activeStep = activeRun.step_id
+        ? `${activeRun.step_id} (${activeRun.agent_id ?? "unknown-agent"})`
+        : "unknown";
+      throw new Error(
+        `Workflow "${workflow.id}" already has an active run (${activeRun.id.slice(0, 8)}), currently at step ${activeStep}. ` +
+        `Wait for completion or use --allow-concurrent to queue another run.`,
+      );
+    }
+  }
 
   const initialContext: Record<string, string> = {
     task: params.taskTitle,

@@ -165,7 +165,8 @@ antfarm dashboard status       # Check status
 
 | Command | Description |
 |---------|-------------|
-| `antfarm workflow run <id> <task>` | Start a run |
+| `antfarm workflow run <id> <task>` | Start a run (default: blocks if same workflow already running) |
+| `antfarm workflow run <id> <task> --allow-concurrent` | Allow queuing another run for same workflow |
 | `antfarm workflow status <query>` | Check run status |
 | `antfarm workflow runs` | List all runs |
 | `antfarm workflow resume <run-id>` | Resume a failed run |

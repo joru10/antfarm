@@ -202,12 +202,12 @@ const ABANDONED_THRESHOLD_MS = 15 * 60 * 1000; // 15 minutes
  */
 function cleanupAbandonedSteps(): void {
   const db = getDb();
-  const cutoff = new Date(Date.now() - ABANDONED_THRESHOLD_MS).toISOString();
+  const cutoffEpoch = Math.floor((Date.now() - ABANDONED_THRESHOLD_MS) / 1000);
 
   // Find running steps that haven't been updated recently
   const abandonedSteps = db.prepare(
-    "SELECT id, step_id, run_id, retry_count, max_retries FROM steps WHERE status = 'running' AND updated_at < ?"
-  ).all(cutoff) as { id: string; step_id: string; run_id: string; retry_count: number; max_retries: number }[];
+    "SELECT id, step_id, run_id, retry_count, max_retries FROM steps WHERE status = 'running' AND COALESCE(unixepoch(updated_at), 0) < ?"
+  ).all(cutoffEpoch) as { id: string; step_id: string; run_id: string; retry_count: number; max_retries: number }[];
 
   for (const step of abandonedSteps) {
     const newRetry = step.retry_count + 1;
@@ -235,8 +235,8 @@ function cleanupAbandonedSteps(): void {
 
   // Also reset any running stories that are abandoned
   const abandonedStories = db.prepare(
-    "SELECT id, retry_count, max_retries, run_id FROM stories WHERE status = 'running' AND updated_at < ?"
-  ).all(cutoff) as { id: string; retry_count: number; max_retries: number; run_id: string }[];
+    "SELECT id, retry_count, max_retries, run_id FROM stories WHERE status = 'running' AND COALESCE(unixepoch(updated_at), 0) < ?"
+  ).all(cutoffEpoch) as { id: string; retry_count: number; max_retries: number; run_id: string }[];
 
   for (const story of abandonedStories) {
     const newRetry = story.retry_count + 1;
@@ -266,7 +266,12 @@ export function claimStep(agentId: string): ClaimResult {
   const db = getDb();
 
   const step = db.prepare(
-    "SELECT id, run_id, input_template, type, loop_config FROM steps WHERE agent_id = ? AND status = 'pending' LIMIT 1"
+    `SELECT s.id, s.run_id, s.input_template, s.type, s.loop_config
+     FROM steps s
+     JOIN runs r ON r.id = s.run_id
+     WHERE s.agent_id = ? AND s.status = 'pending' AND r.status = 'running'
+     ORDER BY r.created_at ASC, s.step_index ASC
+     LIMIT 1`
   ).get(agentId) as { id: string; run_id: string; input_template: string; type: string; loop_config: string | null } | undefined;
 
   if (!step) return { found: false };
