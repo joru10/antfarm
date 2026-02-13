@@ -9,14 +9,45 @@ interface GatewayConfig {
   token?: string;
 }
 
+function resolveOpenClawConfigPath(): string {
+  const explicit = process.env.OPENCLAW_CONFIG_PATH?.trim();
+  if (explicit) return explicit;
+  const stateDir = process.env.OPENCLAW_STATE_DIR?.trim();
+  if (stateDir) return path.join(stateDir, "openclaw.json");
+  return path.join(os.homedir(), ".openclaw", "openclaw.json");
+}
+
+function parsePortFromUrl(value: unknown): number | undefined {
+  if (typeof value !== "string" || value.trim().length === 0) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.port) {
+      const parsed = Number(url.port);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+    }
+    if (url.protocol === "https:" || url.protocol === "wss:") return 443;
+    if (url.protocol === "http:" || url.protocol === "ws:") return 80;
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 async function readOpenClawConfig(): Promise<{ port?: number; token?: string }> {
-  const configPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
+  const configPath = resolveOpenClawConfigPath();
   try {
     const content = await fs.readFile(configPath, "utf-8");
     const config = JSON.parse(content);
+    const port =
+      config.gateway?.port ??
+      parsePortFromUrl(config.gateway?.remote?.url) ??
+      parsePortFromUrl(config.gateway?.url);
+    const token =
+      config.gateway?.auth?.token ??
+      config.gateway?.remote?.token;
     return {
-      port: config.gateway?.port,
-      token: config.gateway?.auth?.token,
+      port,
+      token,
     };
   } catch {
     return {};
@@ -102,11 +133,32 @@ function runCli(args: string[]): Promise<string> {
     const env = {
       ...process.env,
       OPENCLAW_GATEWAY_PORT: String(gateway.port),
+      ...(gateway.token ? { OPENCLAW_GATEWAY_TOKEN: gateway.token } : {}),
       ...(runner.env ?? {}),
     };
     execFile(runner.command, finalArgs, { timeout: 30_000, env }, (err, stdout, stderr) => {
-      if (err) reject(new Error(stderr || err.message));
-      else resolve(stdout);
+      if (!err) {
+        resolve(stdout);
+        return;
+      }
+
+      const dockerArgs = [
+        "exec",
+        "-e",
+        "OPENCLAW_GATEWAY_PORT=18789",
+        ...(gateway.token ? ["-e", `OPENCLAW_GATEWAY_TOKEN=${gateway.token}`] : []),
+        "openclaw-openclaw-gateway-1",
+        "/app/dist/index.js",
+        ...args,
+      ];
+
+      execFile("docker", dockerArgs, { timeout: 30_000, env: process.env }, (dockerErr, dockerStdout, dockerStderr) => {
+        if (!dockerErr) {
+          resolve(dockerStdout);
+          return;
+        }
+        reject(new Error((dockerStderr || dockerErr.message || stderr || err.message).trim()));
+      });
     });
   });
 }

@@ -6,6 +6,22 @@ import { logger } from "../lib/logger.js";
 import { ensureWorkflowCrons } from "./agent-cron.js";
 import { emitEvent } from "./events.js";
 
+const DEFAULT_STALE_ACTIVE_RUN_MINUTES = 120;
+
+function parseUtcTimestamp(value: string | null | undefined): number {
+  if (!value) return 0;
+  if (value.includes("T")) return Date.parse(value);
+  return Date.parse(value.replace(" ", "T") + "Z");
+}
+
+function getStaleActiveRunThresholdMs(): number {
+  const raw = process.env.ANTFARM_STALE_ACTIVE_RUN_MINUTES;
+  if (!raw) return DEFAULT_STALE_ACTIVE_RUN_MINUTES * 60_000;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_STALE_ACTIVE_RUN_MINUTES * 60_000;
+  return Math.floor(parsed * 60_000);
+}
+
 export async function runWorkflow(params: {
   workflowId: string;
   taskTitle: string;
@@ -20,17 +36,91 @@ export async function runWorkflow(params: {
 
   if (!params.allowConcurrent) {
     const activeRun = db.prepare(
-      `SELECT r.id, r.created_at, s.step_id, s.agent_id
+      `SELECT
+         r.id,
+         r.created_at,
+         r.updated_at AS run_updated_at,
+         (
+           SELECT s2.step_id
+           FROM steps s2
+           WHERE s2.run_id = r.id AND s2.status IN ('pending', 'running')
+           ORDER BY s2.step_index ASC
+           LIMIT 1
+         ) AS step_id,
+         (
+           SELECT s2.agent_id
+           FROM steps s2
+           WHERE s2.run_id = r.id AND s2.status IN ('pending', 'running')
+           ORDER BY s2.step_index ASC
+           LIMIT 1
+         ) AS agent_id,
+         (
+           SELECT MAX(s2.updated_at)
+           FROM steps s2
+           WHERE s2.run_id = r.id
+         ) AS step_updated_at,
+         (
+           SELECT COUNT(*)
+           FROM steps s2
+           WHERE s2.run_id = r.id AND s2.status = 'running'
+         ) AS running_steps
        FROM runs r
-       LEFT JOIN steps s ON s.run_id = r.id AND s.status IN ('pending', 'running')
        WHERE r.workflow_id = ? AND r.status = 'running'
        ORDER BY r.created_at ASC
        LIMIT 1`
     ).get(workflow.id) as
-      | { id: string; created_at: string; step_id: string | null; agent_id: string | null }
+      | {
+          id: string;
+          created_at: string;
+          run_updated_at: string;
+          step_id: string | null;
+          agent_id: string | null;
+          step_updated_at: string | null;
+          running_steps: number;
+        }
       | undefined;
 
     if (activeRun) {
+      const nowMs = Date.now();
+      const staleThresholdMs = getStaleActiveRunThresholdMs();
+      const lastActivityMs = Math.max(
+        parseUtcTimestamp(activeRun.created_at),
+        parseUtcTimestamp(activeRun.run_updated_at),
+        parseUtcTimestamp(activeRun.step_updated_at),
+      );
+      const isStale = activeRun.running_steps === 0 && lastActivityMs > 0 && (nowMs - lastActivityMs) > staleThresholdMs;
+
+      if (isStale) {
+        const staleMinutes = Math.floor((nowMs - lastActivityMs) / 60_000);
+        db.exec("BEGIN");
+        try {
+          db.prepare("UPDATE runs SET status = 'failed', updated_at = ? WHERE id = ?")
+            .run(new Date().toISOString(), activeRun.id);
+          db.prepare(
+            "UPDATE steps SET status = 'failed', output = COALESCE(output, ?), updated_at = ? WHERE run_id = ? AND status IN ('waiting','pending','running')",
+          ).run(
+            `Auto-failed stale run after ${staleMinutes} minutes without progress`,
+            new Date().toISOString(),
+            activeRun.id,
+          );
+          db.exec("COMMIT");
+        } catch (err) {
+          db.exec("ROLLBACK");
+          throw err;
+        }
+
+        emitEvent({
+          ts: new Date().toISOString(),
+          event: "run.failed",
+          runId: activeRun.id,
+          workflowId: workflow.id,
+          detail: `Auto-recovered stale active run after ${staleMinutes} minutes without progress`,
+        });
+        await logger.warn("Auto-failed stale active run", {
+          workflowId: workflow.id,
+          runId: activeRun.id,
+        });
+      } else {
       const activeStep = activeRun.step_id
         ? `${activeRun.step_id} (${activeRun.agent_id ?? "unknown-agent"})`
         : "unknown";
@@ -38,6 +128,7 @@ export async function runWorkflow(params: {
         `Workflow "${workflow.id}" already has an active run (${activeRun.id.slice(0, 8)}), currently at step ${activeStep}. ` +
         `Wait for completion or use --allow-concurrent to queue another run.`,
       );
+      }
     }
   }
 

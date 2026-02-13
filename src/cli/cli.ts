@@ -20,13 +20,14 @@ import { uninstallAllWorkflows, uninstallWorkflow, checkActiveRuns } from "../in
 import { getWorkflowStatus, listRuns } from "../installer/status.js";
 import { runWorkflow } from "../installer/run.js";
 import { listBundledWorkflows } from "../installer/workflow-fetch.js";
-import { readRecentLogs } from "../lib/logger.js";
-import { getRecentEvents, getRunEvents, type AntfarmEvent } from "../installer/events.js";
+import { readRecentLogs, logger } from "../lib/logger.js";
+import { getRecentEvents, getRunEvents, type AntfarmEvent, emitEvent } from "../installer/events.js";
 import { startDaemon, stopDaemon, getDaemonStatus, isRunning } from "../server/daemonctl.js";
 import { claimStep, completeStep, failStep, getStories } from "../installer/step-ops.js";
 import { ensureCliSymlink } from "../installer/symlink.js";
 import { getDb } from "../db.js";
 import { listCronJobs } from "../installer/gateway-api.js";
+import { teardownWorkflowCronsIfIdle } from "../installer/agent-cron.js";
 import { execFileSync, execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -48,6 +49,25 @@ function getVersion(): string {
 function formatEventTime(ts: string): string {
   const d = new Date(ts);
   return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true });
+}
+
+const DEFAULT_STALE_ACTIVE_RUN_MINUTES = 120;
+
+function parseUtcTimestamp(value: string | null | undefined): number {
+  if (!value) return 0;
+  if (value.includes("T")) return Date.parse(value);
+  return Date.parse(value.replace(" ", "T") + "Z");
+}
+
+function getStaleThresholdMs(minutesOverride?: number): number {
+  if (minutesOverride && Number.isFinite(minutesOverride) && minutesOverride > 0) {
+    return Math.floor(minutesOverride * 60_000);
+  }
+  const raw = process.env.ANTFARM_STALE_ACTIVE_RUN_MINUTES;
+  if (!raw) return DEFAULT_STALE_ACTIVE_RUN_MINUTES * 60_000;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_STALE_ACTIVE_RUN_MINUTES * 60_000;
+  return Math.floor(parsed * 60_000);
 }
 
 function formatEventLabel(evt: AntfarmEvent): string {
@@ -97,6 +117,8 @@ function printUsage() {
       "antfarm workflow status <query>      Check run status (task substring, run ID prefix)",
       "antfarm workflow runs                List all workflow runs",
       "antfarm workflow resume <run-id>     Resume a failed run from where it left off",
+      "antfarm workflow cleanup-stale [workflow-id] [--minutes N] [--dry-run]",
+      "                                    Fail stale running runs stuck with no active step progress",
       "",
       "antfarm dashboard [start] [--port N]   Start dashboard daemon (default: 3333)",
       "antfarm dashboard stop                  Stop dashboard daemon",
@@ -501,6 +523,147 @@ async function main() {
     if (workflows.length === 0) { process.stdout.write("No workflows available.\n"); } else {
       process.stdout.write("Available workflows:\n");
       for (const w of workflows) process.stdout.write(`  ${w}\n`);
+    }
+    return;
+  }
+
+  if (action === "cleanup-stale") {
+    const dryRun = args.includes("--dry-run");
+    const minutesIdx = args.indexOf("--minutes");
+    let minutesOverride: number | undefined;
+    if (minutesIdx !== -1) {
+      const raw = args[minutesIdx + 1];
+      const parsed = Number(raw);
+      if (!raw || !Number.isFinite(parsed) || parsed <= 0) {
+        process.stderr.write("Invalid --minutes value. Use a positive number.\n");
+        process.exit(1);
+      }
+      minutesOverride = parsed;
+    }
+
+    const workflowId = target && !target.startsWith("--") ? target : undefined;
+    const thresholdMs = getStaleThresholdMs(minutesOverride);
+    const nowMs = Date.now();
+    const thresholdMinutes = Math.floor(thresholdMs / 60_000);
+    const db = getDb();
+
+    const runs = db.prepare(
+      `SELECT id, workflow_id, task, created_at, updated_at
+       FROM runs
+       WHERE status = 'running'
+         AND (? IS NULL OR workflow_id = ?)
+       ORDER BY created_at ASC`
+    ).all(workflowId ?? null, workflowId ?? null) as Array<{
+      id: string;
+      workflow_id: string;
+      task: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+
+    const staleRuns: Array<{
+      id: string;
+      workflowId: string;
+      task: string;
+      staleMinutes: number;
+      stepId: string | null;
+      agentId: string | null;
+    }> = [];
+
+    for (const run of runs) {
+      const stepMeta = db.prepare(
+        `SELECT
+           MAX(updated_at) AS max_updated_at,
+           SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running_steps
+         FROM steps
+         WHERE run_id = ?`
+      ).get(run.id) as { max_updated_at: string | null; running_steps: number | null };
+
+      const activeStep = db.prepare(
+        `SELECT step_id, agent_id
+         FROM steps
+         WHERE run_id = ? AND status IN ('pending', 'running')
+         ORDER BY step_index ASC
+         LIMIT 1`
+      ).get(run.id) as { step_id: string; agent_id: string } | undefined;
+
+      const lastActivityMs = Math.max(
+        parseUtcTimestamp(run.created_at),
+        parseUtcTimestamp(run.updated_at),
+        parseUtcTimestamp(stepMeta.max_updated_at),
+      );
+
+      if (lastActivityMs <= 0) continue;
+      const runningSteps = stepMeta.running_steps ?? 0;
+      const ageMs = nowMs - lastActivityMs;
+      if (runningSteps === 0 && ageMs > thresholdMs) {
+        staleRuns.push({
+          id: run.id,
+          workflowId: run.workflow_id,
+          task: run.task,
+          staleMinutes: Math.floor(ageMs / 60_000),
+          stepId: activeStep?.step_id ?? null,
+          agentId: activeStep?.agent_id ?? null,
+        });
+      }
+    }
+
+    if (staleRuns.length === 0) {
+      console.log(`No stale running runs found (threshold: ${thresholdMinutes}m).`);
+      return;
+    }
+
+    if (dryRun) {
+      console.log(`Dry run: ${staleRuns.length} stale run(s) would be failed (threshold: ${thresholdMinutes}m):`);
+      for (const run of staleRuns) {
+        const step = run.stepId ? `${run.stepId} (${run.agentId ?? "unknown-agent"})` : "none";
+        console.log(`  - ${run.id.slice(0, 8)}  ${run.workflowId}  stale=${run.staleMinutes}m  step=${step}  task=${run.task.slice(0, 80)}`);
+      }
+      return;
+    }
+
+    const cleanedWorkflows = new Set<string>();
+    const timestamp = new Date().toISOString();
+    db.exec("BEGIN");
+    try {
+      for (const run of staleRuns) {
+        const reason = `Cleanup-stale: auto-failed after ${run.staleMinutes} minutes without active step progress`;
+        db.prepare("UPDATE runs SET status = 'failed', updated_at = ? WHERE id = ? AND status = 'running'")
+          .run(timestamp, run.id);
+        db.prepare(
+          "UPDATE steps SET status = 'failed', output = COALESCE(output, ?), updated_at = ? WHERE run_id = ? AND status IN ('waiting','pending','running')"
+        ).run(reason, timestamp, run.id);
+        cleanedWorkflows.add(run.workflowId);
+      }
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+
+    for (const run of staleRuns) {
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "run.failed",
+        runId: run.id,
+        workflowId: run.workflowId,
+        detail: `Cleanup-stale failed run after ${run.staleMinutes} minutes of inactivity`,
+      });
+      await logger.warn("Cleanup-stale failed run", { workflowId: run.workflowId, runId: run.id });
+    }
+
+    for (const workflow of cleanedWorkflows) {
+      try {
+        await teardownWorkflowCronsIfIdle(workflow);
+      } catch {
+        // best-effort cleanup
+      }
+    }
+
+    console.log(`Cleaned ${staleRuns.length} stale run(s) (threshold: ${thresholdMinutes}m):`);
+    for (const run of staleRuns) {
+      const step = run.stepId ? `${run.stepId} (${run.agentId ?? "unknown-agent"})` : "none";
+      console.log(`  - ${run.id.slice(0, 8)}  ${run.workflowId}  stale=${run.staleMinutes}m  step=${step}`);
     }
     return;
   }

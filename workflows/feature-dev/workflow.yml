@@ -117,15 +117,22 @@ steps:
       BRANCH: {{branch}}
 
       Instructions:
-      1. cd into the repo
-      2. Create the feature branch (git checkout -b {{branch}})
-      3. Read package.json, CI config, test config to understand the build/test setup
-      4. Run the build to establish a baseline
-      5. Run the tests to establish a baseline
-      6. Report what you found
+      1. Run mandatory PR preflight check:
+         bash /home/node/.openclaw/workspace/antfarm/scripts/pr-preflight.sh "{{repo}}"
+         If this command fails, stop immediately and fail the step with the exact preflight error.
+      2. cd into the repo
+      3. Create the feature branch (git checkout -b {{branch}})
+      4. Read package.json, CI config, test config to understand the build/test setup
+      5. Run the build to establish a baseline
+      6. Run the tests to establish a baseline
+      7. Report what you found
 
       Reply with:
       STATUS: done
+      PRECHECK_STATUS: ok
+      PR_READY: yes
+      GH_AUTH: ok
+      DEFAULT_REMOTE: <remote name>
       BUILD_CMD: <build command>
       TEST_CMD: <test command>
       CI_NOTES: <brief CI notes>

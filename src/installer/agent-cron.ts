@@ -1,13 +1,15 @@
 import { createAgentCronJob, deleteAgentCronJobs, listCronJobs, checkCronToolAvailable } from "./gateway-api.js";
 import type { WorkflowSpec } from "./types.js";
-import { resolveAntfarmCli } from "./paths.js";
 import { getDb } from "../db.js";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { resolveOpenClawStateDir } from "./paths.js";
 
 const DEFAULT_EVERY_MS = 300_000; // 5 minutes
 
 function buildAgentPrompt(workflowId: string, agentId: string): string {
   const fullAgentId = `${workflowId}/${agentId}`;
-  const cli = resolveAntfarmCli();
+  const cli = "~/.openclaw/workspace/antfarm/dist/cli/cli.js";
 
   return `You are an Antfarm workflow agent. Check for pending work and execute it.
 
@@ -73,10 +75,35 @@ export async function setupAgentCrons(workflow: WorkflowSpec): Promise<void> {
       throw new Error(`Failed to create cron job for agent "${agent.id}": ${result.error}`);
     }
   }
+  await forceWorkflowWakeModeNow(workflow.id);
 }
 
 export async function removeAgentCrons(workflowId: string): Promise<void> {
   await deleteAgentCronJobs(`antfarm/${workflowId}/`);
+}
+
+async function forceWorkflowWakeModeNow(workflowId: string): Promise<void> {
+  const cronPath = path.join(resolveOpenClawStateDir(), "cron", "jobs.json");
+  try {
+    const raw = await fs.readFile(cronPath, "utf-8");
+    const parsed = JSON.parse(raw) as { jobs?: Array<Record<string, unknown>> };
+    if (!Array.isArray(parsed.jobs)) return;
+    let changed = false;
+    const prefix = `antfarm/${workflowId}/`;
+    for (const job of parsed.jobs) {
+      const name = String(job.name ?? "");
+      if (!name.startsWith(prefix)) continue;
+      if (job.wakeMode !== "now") {
+        job.wakeMode = "now";
+        changed = true;
+      }
+    }
+    if (changed) {
+      await fs.writeFile(cronPath, JSON.stringify(parsed, null, 2));
+    }
+  } catch {
+    // Non-fatal: if we cannot normalize wake mode, cron jobs still exist.
+  }
 }
 
 // ── Run-scoped cron lifecycle ───────────────────────────────────────

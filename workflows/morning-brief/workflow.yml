@@ -1,0 +1,80 @@
+id: morning-brief
+name: Morning Brief
+version: 1
+description: |
+  Daily morning intelligence brief with calendar, markets, news (2-source verified), 
+  and AI/data center updates. Runs at 07:30 CET.
+
+cron:
+  interval_ms: 60000
+
+agents:
+  - id: coordinator
+    name: Brief Coordinator
+    role: analysis
+    description: Coordinates brief generation and compiles final output
+    workspace:
+      baseDir: agents/coordinator
+      files:
+        AGENTS.md: agents/coordinator/AGENTS.md
+
+  - id: news-agent
+    name: News Fetcher
+    role: testing
+    description: Fetches news from BBC, Wikipedia, France24 with 2-source verification
+    workspace:
+      baseDir: agents/news-agent
+      files:
+        AGENTS.md: agents/news-agent/AGENTS.md
+
+steps:
+  - id: fetch-news
+    agent: news-agent
+    input: |
+      Fetch today's world news with 2-source verification.
+      
+      WORKING SOURCES:
+      - BBC RSS: curl -s https://feeds.bbci.co.uk/news/world/rss.xml
+      - Wikipedia: curl -s https://r.jina.ai/http://en.wikipedia.org/wiki/Portal:Current_events  
+      - France24: curl -s https://www.france24.com/en/rss
+      
+      BLOCKED (451 errors): Reuters, Guardian, Al Jazeera
+      
+      For each story, verify with 2+ sources and tag:
+      ✅ confirmed (2+ sources)
+      ⚠️ single source
+      
+      Include France focus stories.
+      Output: Brief news summary with confidence tags.
+    expects: "STATUS: done"
+    max_retries: 2
+
+  - id: compile-brief
+    agent: coordinator
+    input: |
+      Compile the morning brief for {{date}}.
+      
+      Format:
+      ## Calendar Today
+      (from Outlook - note if unavailable)
+      
+      ## Markets
+      (❓ unverified - no API keys)
+      
+      ## News & Geopolitics
+      - ✅ confirmed stories (2+ sources)
+      - ⚠️ single source stories
+      - France Focus section
+      
+      ## AI & Data Center Infrastructure
+      (Check Data Center Knowledge, TechCrunch AI)
+      
+      ## Data Quality Summary table
+      
+      Save to: briefs/morning-brief-{{date}}.md
+      
+      Reply with:
+      STATUS: done
+      BRIEF_PATH: briefs/morning-brief-{{date}}.md
+    expects: "STATUS: done"
+    max_retries: 2

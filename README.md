@@ -184,11 +184,12 @@ antfarm dashboard status       # Check status
 
 | Command | Description |
 |---------|-------------|
-| `antfarm workflow run <id> <task>` | Start a run (default: blocks if same workflow already running) |
+| `antfarm workflow run <id> <task>` | Start a run (auto-recovers stale active runs before blocking; stale threshold defaults to 120m) |
 | `antfarm workflow run <id> <task> --allow-concurrent` | Allow queuing another run for same workflow |
 | `antfarm workflow status <query>` | Check run status |
 | `antfarm workflow runs` | List all runs |
 | `antfarm workflow resume <run-id>` | Resume a failed run |
+| `antfarm workflow cleanup-stale [workflow-id] [--minutes N] [--dry-run]` | Fail stale `running` runs with no active step progress |
 | `antfarm workflow list` | List available workflows |
 | `antfarm workflow install <id>` | Install a single workflow |
 | `antfarm workflow uninstall <id>` | Remove a single workflow |
