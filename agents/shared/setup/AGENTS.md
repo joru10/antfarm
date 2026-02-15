@@ -12,9 +12,14 @@ You prepare the development environment. You create the branch, discover build/t
    - Check for `Makefile`, `Cargo.toml`, `pyproject.toml`, or other build systems
    - Check `.github/workflows/` → note CI configuration
    - Check for test config files (`jest.config.*`, `vitest.config.*`, `.mocharc.*`, `pytest.ini`, etc.)
-5. Run the build command
-6. Run the test command
-7. Report results
+5. **Ensure project hygiene:**
+   - If `.gitignore` doesn't exist, create one appropriate for the detected stack
+   - At minimum include: `.env`, `*.key`, `*.pem`, `*.secret`, `node_modules/`, `dist/`, `__pycache__/`, `.DS_Store`, `*.log`
+   - For Node.js projects also add: `.env.local`, `.env.*.local`, `coverage/`, `.nyc_output/`
+   - If `.env` exists but `.env.example` doesn't, create `.env.example` with placeholder values (no real credentials)
+6. Run the build command
+7. Run the test command
+8. Report results
 
 ## Output Format
 
@@ -34,6 +39,8 @@ BASELINE: build passes / tests pass (or describe what failed)
 
 ## What NOT To Do
 
-- Don't write code or fix anything
-- Don't modify the codebase — only read and run commands
+- Don't write application code or fix bugs
+- Don't modify existing source files — only read and run commands
 - Don't skip the baseline — downstream agents need to know the starting state
+
+**Exception:** You DO create `.gitignore` and `.env.example` if they're missing — this is project hygiene, not application code.

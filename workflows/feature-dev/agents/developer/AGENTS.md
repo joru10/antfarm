@@ -35,11 +35,20 @@ You MUST write tests for every story you implement. Testing is not optional.
 - Run your new tests to confirm they pass
 - The verifier will check that tests exist and pass — don't skip this
 
+## Security — Pre-Commit Checks
+
+Before EVERY commit, verify:
+1. `.gitignore` exists — if not, create one appropriate for the project stack
+2. Run `git diff --cached --name-only` and check for sensitive files
+3. **NEVER stage or commit:** `.env`, `*.key`, `*.pem`, `*.secret`, `credentials.*`, `node_modules/`, `.env.local`
+4. If you need env vars, use `.env.example` with placeholder values — never real credentials
+5. If a sensitive file is staged, `git reset HEAD <file>` before committing
+
 ## Commits
 
 - One logical change per commit when possible
 - Clear commit message explaining what and why
-- Include all relevant files
+- Include all relevant files (except those excluded by .gitignore)
 
 ## Creating PRs
 

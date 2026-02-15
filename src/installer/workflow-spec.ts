@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import YAML from "yaml";
-import type { LoopConfig, WorkflowAgent, WorkflowSpec, WorkflowStep } from "./types.js";
+import type { LoopConfig, PollingConfig, WorkflowAgent, WorkflowSpec, WorkflowStep } from "./types.js";
 
 export async function loadWorkflowSpec(workflowDir: string): Promise<WorkflowSpec> {
   const filePath = path.join(workflowDir, "workflow.yml");
@@ -10,11 +10,17 @@ export async function loadWorkflowSpec(workflowDir: string): Promise<WorkflowSpe
   if (!parsed?.id) {
     throw new Error(`workflow.yml missing id in ${workflowDir}`);
   }
+  if (parsed.id.includes("_")) {
+    throw new Error(`workflow.yml id "${parsed.id}" must not contain underscores`);
+  }
   if (!Array.isArray(parsed.agents) || parsed.agents.length === 0) {
     throw new Error(`workflow.yml missing agents list in ${workflowDir}`);
   }
   if (!Array.isArray(parsed.steps) || parsed.steps.length === 0) {
     throw new Error(`workflow.yml missing steps list in ${workflowDir}`);
+  }
+  if (parsed.polling) {
+    validatePollingConfig(parsed.polling, workflowDir);
   }
   validateAgents(parsed.agents, workflowDir);
   // Parse type/loop from raw YAML before validation
@@ -31,11 +37,20 @@ export async function loadWorkflowSpec(workflowDir: string): Promise<WorkflowSpe
   return parsed;
 }
 
+function validatePollingConfig(polling: PollingConfig, workflowDir: string) {
+  if (polling.timeoutSeconds !== undefined && polling.timeoutSeconds <= 0) {
+    throw new Error(`workflow.yml polling.timeoutSeconds must be positive in ${workflowDir}`);
+  }
+}
+
 function validateAgents(agents: WorkflowAgent[], workflowDir: string) {
   const ids = new Set<string>();
   for (const agent of agents) {
     if (!agent.id?.trim()) {
       throw new Error(`workflow.yml missing agent id in ${workflowDir}`);
+    }
+    if (agent.id.includes("_")) {
+      throw new Error(`workflow.yml agent "${agent.id}" must not contain underscores (reserved as namespace separator)`);
     }
     if (ids.has(agent.id)) {
       throw new Error(`workflow.yml has duplicate agent id "${agent.id}" in ${workflowDir}`);
@@ -49,6 +64,9 @@ function validateAgents(agents: WorkflowAgent[], workflowDir: string) {
     }
     if (agent.workspace.skills && !Array.isArray(agent.workspace.skills)) {
       throw new Error(`workflow.yml workspace.skills must be a list for agent "${agent.id}"`);
+    }
+    if (agent.timeoutSeconds !== undefined && agent.timeoutSeconds <= 0) {
+      throw new Error(`workflow.yml agent "${agent.id}" timeoutSeconds must be positive`);
     }
   }
 }

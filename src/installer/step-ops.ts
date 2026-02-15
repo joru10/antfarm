@@ -4,9 +4,50 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { execSync, execFileSync } from "node:child_process";
 import { teardownWorkflowCronsIfIdle } from "./agent-cron.js";
 import { emitEvent } from "./events.js";
 import { logger } from "../lib/logger.js";
+import { getMaxRoleTimeoutSeconds } from "./install.js";
+import { isFrontendChange } from "../lib/frontend-detect.js";
+
+/**
+ * Parse KEY: value lines from step output with support for multi-line values.
+ * Accumulates continuation lines until the next KEY: boundary or end of output.
+ * Returns a map of lowercase keys to their (trimmed) values.
+ * Skips STORIES_JSON keys (handled separately).
+ */
+export function parseOutputKeyValues(output: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  const lines = output.split("\n");
+  let pendingKey: string | null = null;
+  let pendingValue = "";
+
+  function commitPending() {
+    if (pendingKey && !pendingKey.startsWith("STORIES_JSON")) {
+      result[pendingKey.toLowerCase()] = pendingValue.trim();
+    }
+    pendingKey = null;
+    pendingValue = "";
+  }
+
+  for (const line of lines) {
+    const match = line.match(/^([A-Z_]+):\s*(.*)$/);
+    if (match) {
+      // New KEY: line found — flush previous key
+      commitPending();
+      pendingKey = match[1];
+      pendingValue = match[2];
+    } else if (pendingKey) {
+      // Continuation line — append to current key's value
+      pendingValue += "\n" + line;
+    }
+  }
+  // Flush any remaining pending value
+  commitPending();
+
+  return result;
+}
 
 /**
  * Fire-and-forget cron teardown when a run ends.
@@ -72,7 +113,11 @@ function readProgressFile(runId: string): string {
   const workspace = getAgentWorkspacePath(loopStep.agent_id);
   if (!workspace) return "(no progress file)";
   try {
-    return fs.readFileSync(path.join(workspace, "progress.txt"), "utf-8");
+    // Try run-scoped file first, fall back to legacy progress.txt
+    const scopedPath = path.join(workspace, `progress-${runId}.txt`);
+    const legacyPath = path.join(workspace, "progress.txt");
+    const filePath = fs.existsSync(scopedPath) ? scopedPath : legacyPath;
+    return fs.readFileSync(filePath, "utf-8");
   } catch {
     return "(no progress yet)";
   }
@@ -195,23 +240,41 @@ function parseAndInsertStories(output: string, runId: string): void {
 
 // ── Abandoned Step Cleanup ──────────────────────────────────────────
 
-const ABANDONED_THRESHOLD_MS = 15 * 60 * 1000; // 15 minutes
+const ABANDONED_THRESHOLD_MS = (getMaxRoleTimeoutSeconds() + 5 * 60) * 1000; // max role timeout + 5 min buffer
+const MAX_ABANDON_RESETS = 5; // abandoned steps get more chances than explicit failures
 
 /**
  * Find steps that have been "running" for too long and reset them to pending.
  * This catches cases where an agent claimed a step but never completed/failed it.
+ * Exported so it can be called from medic/health-check crons independently of claimStep.
  */
-function cleanupAbandonedSteps(): void {
+export function cleanupAbandonedSteps(): void {
   const db = getDb();
-  // Use SQLite datetime() to normalize both sides — handles mixed T/space formats in updated_at
-  const cutoffSec = Math.floor(ABANDONED_THRESHOLD_MS / 1000);
+  // Use numeric comparison so mixed timestamp formats don't break ordering.
+  const thresholdMs = ABANDONED_THRESHOLD_MS;
 
   // Find running steps that haven't been updated recently
   const abandonedSteps = db.prepare(
-    "SELECT id, step_id, run_id, retry_count, max_retries, type, current_story_id FROM steps WHERE status = 'running' AND datetime(updated_at) < datetime('now', ?)"
-  ).all(`-${cutoffSec} seconds`) as { id: string; step_id: string; run_id: string; retry_count: number; max_retries: number; type: string; current_story_id: string | null }[];
+    "SELECT id, step_id, run_id, retry_count, max_retries, type, current_story_id, loop_config, abandoned_count FROM steps WHERE status = 'running' AND (julianday('now') - julianday(updated_at)) * 86400000 > ?"
+  ).all(thresholdMs) as { id: string; step_id: string; run_id: string; retry_count: number; max_retries: number; type: string; current_story_id: string | null; loop_config: string | null; abandoned_count: number }[];
 
   for (const step of abandonedSteps) {
+    if (step.type === "loop" && !step.current_story_id && step.loop_config) {
+      try {
+        const loopConfig: LoopConfig = JSON.parse(step.loop_config);
+        if (loopConfig.verifyEach && loopConfig.verifyStep) {
+          const verifyStatus = db.prepare(
+            "SELECT status FROM steps WHERE run_id = ? AND step_id = ? LIMIT 1"
+          ).get(step.run_id, loopConfig.verifyStep) as { status: string } | undefined;
+          if (verifyStatus?.status === "pending" || verifyStatus?.status === "running") {
+            continue;
+          }
+        }
+      } catch {
+        // If loop config is malformed, fall through to abandonment handling.
+      }
+    }
+
     // Loop steps: apply per-story retry, not per-step retry (#35)
     if (step.type === "loop" && step.current_story_id) {
       const story = db.prepare(
@@ -222,7 +285,6 @@ function cleanupAbandonedSteps(): void {
         const newRetry = story.retry_count + 1;
         const wfId = getWorkflowId(step.run_id);
         if (newRetry > story.max_retries) {
-          // Story retries exhausted — fail the step and run
           db.prepare("UPDATE stories SET status = 'failed', retry_count = ?, updated_at = datetime('now') WHERE id = ?").run(newRetry, story.id);
           db.prepare("UPDATE steps SET status = 'failed', output = 'Story abandoned and retries exhausted', current_story_id = NULL, updated_at = datetime('now') WHERE id = ?").run(step.id);
           db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(step.run_id);
@@ -231,22 +293,22 @@ function cleanupAbandonedSteps(): void {
           emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Story abandoned and retries exhausted" });
           scheduleRunCronTeardown(step.run_id);
         } else {
-          // Retry the story, reset step to pending
           db.prepare("UPDATE stories SET status = 'pending', retry_count = ?, updated_at = datetime('now') WHERE id = ?").run(newRetry, story.id);
           db.prepare("UPDATE steps SET status = 'pending', current_story_id = NULL, updated_at = datetime('now') WHERE id = ?").run(step.id);
           emitEvent({ ts: new Date().toISOString(), event: "step.timeout", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: `Story ${story.story_id} abandoned — reset to pending (story retry ${newRetry})` });
+          logger.info(`Abandoned step reset to pending (story retry ${newRetry})`, { runId: step.run_id, stepId: step.step_id });
         }
         continue;
       }
     }
 
-    // Single steps (or loop steps without a current story): existing logic
-    const newRetry = step.retry_count + 1;
-    if (newRetry >= step.max_retries) {
-      // Fail the step and run
+    // Single steps (or loop steps without a current story): use abandoned_count, not retry_count
+    const newAbandonCount = (step.abandoned_count ?? 0) + 1;
+    if (newAbandonCount >= MAX_ABANDON_RESETS) {
+      // Too many abandons — fail the step and run
       db.prepare(
-        "UPDATE steps SET status = 'failed', output = 'Agent abandoned step without completing', retry_count = ?, updated_at = datetime('now') WHERE id = ?"
-      ).run(newRetry, step.id);
+        "UPDATE steps SET status = 'failed', output = 'Agent abandoned step without completing (' || ? || ' times)', abandoned_count = ?, updated_at = datetime('now') WHERE id = ?"
+      ).run(newAbandonCount, newAbandonCount, step.id);
       db.prepare(
         "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
       ).run(step.run_id);
@@ -256,27 +318,86 @@ function cleanupAbandonedSteps(): void {
       emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Step abandoned and retries exhausted" });
       scheduleRunCronTeardown(step.run_id);
     } else {
-      // Reset to pending for retry
+      // Reset to pending for retry — do NOT increment retry_count (abandonment != explicit failure)
       db.prepare(
-        "UPDATE steps SET status = 'pending', retry_count = ?, updated_at = datetime('now') WHERE id = ?"
-      ).run(newRetry, step.id);
-      emitEvent({ ts: new Date().toISOString(), event: "step.timeout", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.step_id, detail: `Reset to pending (retry ${newRetry})` });
+        "UPDATE steps SET status = 'pending', abandoned_count = ?, updated_at = datetime('now') WHERE id = ?"
+      ).run(newAbandonCount, step.id);
+      emitEvent({ ts: new Date().toISOString(), event: "step.timeout", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.step_id, detail: `Reset to pending (abandon ${newAbandonCount}/${MAX_ABANDON_RESETS})` });
     }
   }
 
-  // Also reset any running stories that are abandoned
+  // Reset running stories that are abandoned — don't touch "done" stories
+  // Don't increment retry_count for abandonment; only explicit failStep() counts against retries
   const abandonedStories = db.prepare(
-    "SELECT id, retry_count, max_retries, run_id FROM stories WHERE status = 'running' AND datetime(updated_at) < datetime('now', ?)"
-  ).all(`-${cutoffSec} seconds`) as { id: string; retry_count: number; max_retries: number; run_id: string }[];
+    "SELECT id, retry_count, max_retries, run_id FROM stories WHERE status = 'running' AND (julianday('now') - julianday(updated_at)) * 86400000 > ?"
+  ).all(thresholdMs) as { id: string; retry_count: number; max_retries: number; run_id: string }[];
 
   for (const story of abandonedStories) {
-    const newRetry = story.retry_count + 1;
-    if (newRetry >= story.max_retries) {
-      db.prepare("UPDATE stories SET status = 'failed', retry_count = ?, updated_at = datetime('now') WHERE id = ?").run(newRetry, story.id);
-    } else {
-      db.prepare("UPDATE stories SET status = 'pending', retry_count = ?, updated_at = datetime('now') WHERE id = ?").run(newRetry, story.id);
-    }
+    // Simply reset to pending without incrementing retry_count
+    db.prepare("UPDATE stories SET status = 'pending', updated_at = datetime('now') WHERE id = ?").run(story.id);
   }
+
+  // Recover stuck pipelines: loop step done but no subsequent step pending/running
+  const stuckLoops = db.prepare(`
+    SELECT s.id, s.run_id, s.step_index FROM steps s
+    JOIN runs r ON r.id = s.run_id
+    WHERE s.type = 'loop' AND s.status = 'done' AND r.status = 'running'
+    AND NOT EXISTS (
+      SELECT 1 FROM steps s2 WHERE s2.run_id = s.run_id 
+      AND s2.step_index > s.step_index 
+      AND s2.status IN ('pending', 'running')
+    )
+    AND EXISTS (
+      SELECT 1 FROM steps s3 WHERE s3.run_id = s.run_id 
+      AND s3.step_index > s.step_index 
+      AND s3.status = 'waiting'
+    )
+  `).all() as { id: string; run_id: string; step_index: number }[];
+
+  for (const stuck of stuckLoops) {
+    logger.info(`Recovering stuck pipeline after loop completion`, { runId: stuck.run_id, stepId: stuck.id });
+    advancePipeline(stuck.run_id);
+  }
+}
+
+// ── Frontend change detection ───────────────────────────────────────
+
+/**
+ * Compute whether a branch has frontend changes relative to main.
+ * Returns 'true' or 'false' as a string for template context.
+ */
+export function computeHasFrontendChanges(repo: string, branch: string): string {
+  try {
+    const output = execFileSync("git", ["diff", "--name-only", `main..${branch}`], {
+      cwd: repo,
+      encoding: "utf-8",
+      timeout: 10_000,
+    });
+    const files = output.trim().split("\n").filter(f => f.length > 0);
+    return isFrontendChange(files) ? "true" : "false";
+  } catch {
+    return "false";
+  }
+}
+
+// ── Peek (lightweight work check) ───────────────────────────────────
+
+export type PeekResult = "HAS_WORK" | "NO_WORK";
+
+/**
+ * Lightweight check: does this agent have any pending/waiting steps in active runs?
+ * Unlike claimStep(), this runs a single cheap COUNT query — no cleanup, no context resolution.
+ * Returns "HAS_WORK" if any pending/waiting steps exist, "NO_WORK" otherwise.
+ */
+export function peekStep(agentId: string): PeekResult {
+  const db = getDb();
+  const row = db.prepare(
+    `SELECT COUNT(*) as cnt FROM steps s
+     JOIN runs r ON r.id = s.run_id
+     WHERE s.agent_id = ? AND s.status IN ('pending', 'waiting')
+       AND r.status = 'running'`
+  ).get(agentId) as { cnt: number };
+  return row.cnt > 0 ? "HAS_WORK" : "NO_WORK";
 }
 
 // ── Claim ───────────────────────────────────────────────────────────
@@ -289,28 +410,52 @@ interface ClaimResult {
 }
 
 /**
+ * Throttle cleanupAbandonedSteps: run at most once every 5 minutes.
+ */
+let lastCleanupTime = 0;
+const CLEANUP_THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
  * Find and claim a pending step for an agent, returning the resolved input.
  */
 export function claimStep(agentId: string): ClaimResult {
-  // First, cleanup any abandoned steps
-  cleanupAbandonedSteps();
+  // Throttle cleanup: run at most once every 5 minutes across all agents
+  const now = Date.now();
+  if (now - lastCleanupTime >= CLEANUP_THROTTLE_MS) {
+    cleanupAbandonedSteps();
+    lastCleanupTime = now;
+  }
   const db = getDb();
 
   const step = db.prepare(
-    `SELECT s.id, s.run_id, s.input_template, s.type, s.loop_config
+    `SELECT s.id, s.step_id, s.run_id, s.input_template, s.type, s.loop_config
      FROM steps s
      JOIN runs r ON r.id = s.run_id
      WHERE s.agent_id = ? AND s.status = 'pending'
        AND r.status NOT IN ('failed', 'cancelled')
      ORDER BY r.created_at ASC, s.step_index ASC
      LIMIT 1`
-  ).get(agentId) as { id: string; run_id: string; input_template: string; type: string; loop_config: string | null } | undefined;
+  ).get(agentId) as { id: string; step_id: string; run_id: string; input_template: string; type: string; loop_config: string | null } | undefined;
 
   if (!step) return { found: false };
+
+  // Guard: don't claim work for a failed run
+  const runStatus = db.prepare("SELECT status FROM runs WHERE id = ?").get(step.run_id) as { status: string } | undefined;
+  if (runStatus?.status === "failed") return { found: false };
 
   // Get run context
   const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(step.run_id) as { context: string } | undefined;
   const context: Record<string, string> = run ? JSON.parse(run.context) : {};
+
+  // Always inject run_id so templates can use {{run_id}} (e.g. for scoped progress files)
+  context["run_id"] = step.run_id;
+
+  // Compute has_frontend_changes from git diff when repo and branch are available
+  if (context["repo"] && context["branch"]) {
+    context["has_frontend_changes"] = computeHasFrontendChanges(context["repo"], context["branch"]);
+  } else {
+    context["has_frontend_changes"] = "false";
+  }
 
   // T6: Loop step claim logic
   if (step.type === "loop") {
@@ -322,11 +467,30 @@ export function claimStep(agentId: string): ClaimResult {
       ).get(step.run_id) as any | undefined;
 
       if (!nextStory) {
-        // No more stories — mark step done and advance
+        const failedStory = db.prepare(
+          "SELECT id FROM stories WHERE run_id = ? AND status = 'failed' LIMIT 1"
+        ).get(step.run_id) as { id: string } | undefined;
+
+        if (failedStory) {
+          // No pending stories left, but failures remain — fail loop + run
+          db.prepare(
+            "UPDATE steps SET status = 'failed', output = ?, updated_at = datetime('now') WHERE id = ?"
+          ).run("Loop cannot continue because one or more stories failed", step.id);
+          db.prepare(
+            "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
+          ).run(step.run_id);
+          const wfId = getWorkflowId(step.run_id);
+          emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.id, agentId: agentId, detail: "Loop has failed stories and no pending stories" });
+          emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Loop has failed stories and no pending stories" });
+          scheduleRunCronTeardown(step.run_id);
+          return { found: false };
+        }
+
+        // No pending or failed stories — mark step done and advance
         db.prepare(
           "UPDATE steps SET status = 'done', updated_at = datetime('now') WHERE id = ?"
         ).run(step.id);
-        emitEvent({ ts: new Date().toISOString(), event: "step.done", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.id, agentId: agentId });
+        emitEvent({ ts: new Date().toISOString(), event: "step.done", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.step_id, agentId: agentId });
         advancePipeline(step.run_id);
         return { found: false };
       }
@@ -340,9 +504,9 @@ export function claimStep(agentId: string): ClaimResult {
       ).run(nextStory.id, step.id);
 
       const wfId = getWorkflowId(step.run_id);
-      emitEvent({ ts: new Date().toISOString(), event: "step.running", runId: step.run_id, workflowId: wfId, stepId: step.id, agentId: agentId });
-      emitEvent({ ts: new Date().toISOString(), event: "story.started", runId: step.run_id, workflowId: wfId, stepId: step.id, agentId: agentId, storyId: nextStory.story_id, storyTitle: nextStory.title });
-      logger.info(`Story started: ${nextStory.story_id} — ${nextStory.title}`, { runId: step.run_id, stepId: step.id });
+      emitEvent({ ts: new Date().toISOString(), event: "step.running", runId: step.run_id, workflowId: wfId, stepId: step.step_id, agentId: agentId });
+      emitEvent({ ts: new Date().toISOString(), event: "story.started", runId: step.run_id, workflowId: wfId, stepId: step.step_id, agentId: agentId, storyId: nextStory.story_id, storyTitle: nextStory.title });
+      logger.info(`Story started: ${nextStory.story_id} — ${nextStory.title}`, { runId: step.run_id, stepId: step.step_id });
 
       // Build story template vars
       const story: Story = {
@@ -385,8 +549,8 @@ export function claimStep(agentId: string): ClaimResult {
   db.prepare(
     "UPDATE steps SET status = 'running', updated_at = datetime('now') WHERE id = ? AND status = 'pending'"
   ).run(step.id);
-  emitEvent({ ts: new Date().toISOString(), event: "step.running", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.id, agentId: agentId });
-  logger.info(`Step claimed by ${agentId}`, { runId: step.run_id, stepId: step.id });
+  emitEvent({ ts: new Date().toISOString(), event: "step.running", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.step_id, agentId: agentId });
+  logger.info(`Step claimed by ${agentId}`, { runId: step.run_id, stepId: step.step_id });
 
   // Inject progress for any step in a run that has stories
   const hasStories = db.prepare(
@@ -420,15 +584,20 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
 
   if (!step) throw new Error(`Step not found: ${stepId}`);
 
+  // Guard: don't process completions for failed runs
+  const runCheck = db.prepare("SELECT status FROM runs WHERE id = ?").get(step.run_id) as { status: string } | undefined;
+  if (runCheck?.status === "failed") {
+    return { advanced: false, runCompleted: false };
+  }
+
   // Merge KEY: value lines into run context
   const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(step.run_id) as { context: string };
   const context: Record<string, string> = JSON.parse(run.context);
 
-  for (const line of output.split("\n")) {
-    const match = line.match(/^([A-Z_]+):\s*(.+)$/);
-    if (match && !match[1].startsWith("STORIES_JSON")) {
-      context[match[1].toLowerCase()] = match[2].trim();
-    }
+  // Parse KEY: value lines and merge into context
+  const parsed = parseOutputKeyValues(output);
+  for (const [key, value] of Object.entries(parsed)) {
+    context[key] = value;
   }
 
   db.prepare(
@@ -447,8 +616,8 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
     db.prepare(
       "UPDATE stories SET status = 'done', output = ?, updated_at = datetime('now') WHERE id = ?"
     ).run(output, step.current_story_id);
-    emitEvent({ ts: new Date().toISOString(), event: "story.done", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.id, storyId: storyRow?.story_id, storyTitle: storyRow?.title });
-    logger.info(`Story done: ${storyRow?.story_id} — ${storyRow?.title}`, { runId: step.run_id, stepId: step.id });
+    emitEvent({ ts: new Date().toISOString(), event: "story.done", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.step_id, storyId: storyRow?.story_id, storyTitle: storyRow?.title });
+    logger.info(`Story done: ${storyRow?.story_id} — ${storyRow?.title}`, { runId: step.run_id, stepId: step.step_id });
 
     // Clear current_story_id, save output
     db.prepare(
@@ -497,8 +666,8 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   db.prepare(
     "UPDATE steps SET status = 'done', output = ?, updated_at = datetime('now') WHERE id = ?"
   ).run(output, stepId);
-  emitEvent({ ts: new Date().toISOString(), event: "step.done", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.id });
-  logger.info(`Step completed: ${step.step_id}`, { runId: step.run_id, stepId: step.id });
+  emitEvent({ ts: new Date().toISOString(), event: "step.done", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.step_id });
+  logger.info(`Step completed: ${step.step_id}`, { runId: step.run_id, stepId: step.step_id });
 
   return advancePipeline(step.run_id);
 }
@@ -522,7 +691,7 @@ function handleVerifyEachCompletion(
 
   if (status !== "retry") {
     // Verify passed
-    emitEvent({ ts: new Date().toISOString(), event: "story.verified", runId: verifyStep.run_id, workflowId: getWorkflowId(verifyStep.run_id), stepId: verifyStep.id });
+    emitEvent({ ts: new Date().toISOString(), event: "story.verified", runId: verifyStep.run_id, workflowId: getWorkflowId(verifyStep.run_id), stepId: verifyStep.step_id });
   }
 
   if (status === "retry") {
@@ -539,7 +708,7 @@ function handleVerifyEachCompletion(
         db.prepare("UPDATE steps SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(loopStepId);
         db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(verifyStep.run_id);
         const wfId = getWorkflowId(verifyStep.run_id);
-        emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: verifyStep.run_id, workflowId: wfId, stepId: verifyStep.id });
+        emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: verifyStep.run_id, workflowId: wfId, stepId: verifyStep.step_id });
         emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: verifyStep.run_id, workflowId: wfId, detail: "Verification retries exhausted" });
         scheduleRunCronTeardown(verifyStep.run_id);
         return { advanced: false, runCompleted: false };
@@ -551,7 +720,7 @@ function handleVerifyEachCompletion(
       // Store verify feedback
       const issues = context["issues"] ?? output;
       context["verify_feedback"] = issues;
-      emitEvent({ ts: new Date().toISOString(), event: "story.retry", runId: verifyStep.run_id, workflowId: getWorkflowId(verifyStep.run_id), stepId: verifyStep.id, detail: issues });
+      emitEvent({ ts: new Date().toISOString(), event: "story.retry", runId: verifyStep.run_id, workflowId: getWorkflowId(verifyStep.run_id), stepId: verifyStep.step_id, detail: issues });
       db.prepare("UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(context), verifyStep.run_id);
     }
 
@@ -564,7 +733,14 @@ function handleVerifyEachCompletion(
   delete context["verify_feedback"];
   db.prepare("UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(context), verifyStep.run_id);
 
-  return checkLoopContinuation(verifyStep.run_id, loopStepId);
+  try {
+    return checkLoopContinuation(verifyStep.run_id, loopStepId);
+  } catch (err) {
+    logger.error(`checkLoopContinuation failed, recovering: ${String(err)}`, { runId: verifyStep.run_id });
+    // Ensure loop step is at least pending so cron can retry
+    db.prepare("UPDATE steps SET status = 'pending', updated_at = datetime('now') WHERE id = ?").run(loopStepId);
+    return { advanced: false, runCompleted: false };
+  }
 }
 
 /**
@@ -576,11 +752,37 @@ function checkLoopContinuation(runId: string, loopStepId: string): { advanced: b
     "SELECT id FROM stories WHERE run_id = ? AND status = 'pending' LIMIT 1"
   ).get(runId) as { id: string } | undefined;
 
+  const loopStatus = db.prepare(
+    "SELECT status FROM steps WHERE id = ?"
+  ).get(loopStepId) as { status: string } | undefined;
+
   if (pendingStory) {
+    if (loopStatus?.status === "failed") {
+      return { advanced: false, runCompleted: false };
+    }
     // More stories — loop step back to pending
     db.prepare(
       "UPDATE steps SET status = 'pending', updated_at = datetime('now') WHERE id = ?"
     ).run(loopStepId);
+    return { advanced: false, runCompleted: false };
+  }
+
+  const failedStory = db.prepare(
+    "SELECT id FROM stories WHERE run_id = ? AND status = 'failed' LIMIT 1"
+  ).get(runId) as { id: string } | undefined;
+
+  if (failedStory) {
+    // Nothing pending, but failures remain — fail loop + run
+    db.prepare(
+      "UPDATE steps SET status = 'failed', output = ?, updated_at = datetime('now') WHERE id = ?"
+    ).run("Loop cannot continue because one or more stories failed", loopStepId);
+    db.prepare(
+      "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
+    ).run(runId);
+    const wfId = getWorkflowId(runId);
+    emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId, workflowId: wfId, stepId: loopStepId, detail: "Loop has failed stories and no pending stories" });
+    emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId, workflowId: wfId, detail: "Loop has failed stories and no pending stories" });
+    scheduleRunCronTeardown(runId);
     return { advanced: false, runCompleted: false };
   }
 
@@ -605,27 +807,36 @@ function checkLoopContinuation(runId: string, loopStepId: string): { advanced: b
 
 /**
  * Advance the pipeline: find the next waiting step and make it pending, or complete the run.
+ * Respects terminal run states — a failed run cannot be advanced or completed.
  */
 function advancePipeline(runId: string): { advanced: boolean; runCompleted: boolean } {
   const db = getDb();
 
-  // Guard: don't advance or complete a run that's already failed (#38)
+  // Guard: don't advance or complete a run that's already failed/cancelled
   const runStatus = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string } | undefined;
   if (runStatus?.status === "failed" || runStatus?.status === "cancelled") {
     return { advanced: false, runCompleted: false };
   }
 
   const next = db.prepare(
-    "SELECT id FROM steps WHERE run_id = ? AND status = 'waiting' ORDER BY step_index ASC LIMIT 1"
+    "SELECT id, step_id FROM steps WHERE run_id = ? AND status = 'waiting' ORDER BY step_index ASC LIMIT 1"
+  ).get(runId) as { id: string; step_id: string } | undefined;
+
+  const incomplete = db.prepare(
+    "SELECT id FROM steps WHERE run_id = ? AND status IN ('failed', 'pending', 'running') LIMIT 1"
   ).get(runId) as { id: string } | undefined;
+
+  if (!next && incomplete) {
+    return { advanced: false, runCompleted: false };
+  }
 
   const wfId = getWorkflowId(runId);
   if (next) {
     db.prepare(
       "UPDATE steps SET status = 'pending', updated_at = datetime('now') WHERE id = ?"
     ).run(next.id);
-    emitEvent({ ts: new Date().toISOString(), event: "pipeline.advanced", runId, workflowId: wfId, stepId: next.id });
-    emitEvent({ ts: new Date().toISOString(), event: "step.pending", runId, workflowId: wfId, stepId: next.id });
+    emitEvent({ ts: new Date().toISOString(), event: "pipeline.advanced", runId, workflowId: wfId, stepId: next.step_id });
+    emitEvent({ ts: new Date().toISOString(), event: "step.pending", runId, workflowId: wfId, stepId: next.step_id });
     return { advanced: true, runCompleted: false };
   } else {
     db.prepare(
@@ -653,13 +864,16 @@ export function archiveRunProgress(runId: string): void {
   const workspace = getAgentWorkspacePath(loopStep.agent_id);
   if (!workspace) return;
 
-  const progressPath = path.join(workspace, "progress.txt");
+  const scopedPath = path.join(workspace, `progress-${runId}.txt`);
+  const legacyPath = path.join(workspace, "progress.txt");
+  // Prefer run-scoped file, fall back to legacy
+  const progressPath = fs.existsSync(scopedPath) ? scopedPath : legacyPath;
   if (!fs.existsSync(progressPath)) return;
 
   const archiveDir = path.join(workspace, "archive", runId);
   fs.mkdirSync(archiveDir, { recursive: true });
   fs.copyFileSync(progressPath, path.join(archiveDir, "progress.txt"));
-  fs.writeFileSync(progressPath, ""); // truncate
+  fs.unlinkSync(progressPath); // clean up
 }
 
 /**

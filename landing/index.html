@@ -47,18 +47,20 @@
         <h1>Build your agent team in <a href="https://docs.openclaw.ai">OpenClaw</a> with one command</h1>
       </div>
       <p class="hero-sub">You don't need to hire a dev team. You need to define one. Antfarm gives you a team of specialized AI agents — planner, developer, verifier, tester, reviewer — that work together in reliable, repeatable workflows. One install. Zero infrastructure.</p>
-      <div class="hero-actions">
-        <div class="install-cmd">
-          <code><span class="cmd-prompt">$</span> install github.com/snarktank/antfarm</code>
-          <button class="copy-btn" onclick="navigator.clipboard.writeText('install github.com/snarktank/antfarm').then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)})" title="Copy to clipboard">Copy</button>
-        </div>
-        <p class="install-hint">Tell your OpenClaw agent. That's it.</p>
-      </div>
     </section>
 
-    <!-- The problem -->
-    <section class="section problem-section">
-      <h2 class="problem-text">Antfarm gives you a team of agents that specialize, verify each other, and run the same playbook every time.</h2>
+    <section class="section">
+      <h2>Antfarm gives you a team of agents that specialize, verify each other, and run the same playbook every time.</h2>
+      <div class="install-block">
+        <div class="install-row">
+          <div class="install-cmd">
+            <code><span class="cmd-prompt">$</span> curl -fsSL https://raw.githubusercontent.com/snarktank/antfarm/v0.5.0/scripts/install.sh | bash</code>
+          </div>
+          <button class="copy-btn" onclick="navigator.clipboard.writeText('curl -fsSL https://raw.githubusercontent.com/snarktank/antfarm/v0.5.0/scripts/install.sh | bash').then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)})" title="Copy to clipboard">Copy</button>
+          <span class="version-badge">v0.5.0</span>
+        </div>
+        <p class="install-hint">Paste in your terminal, or just ask your OpenClaw to run it.</p>
+      </div>
     </section>
 
     <!-- Bundled workflows -->
@@ -68,7 +70,7 @@
         <div class="wf-card">
           <div class="wf-header">
             <h3>feature-dev</h3>
-            <span class="wf-badge">7 agents</span>
+            <span class="wf-badge">6 agents</span>
           </div>
           <p>Drop in a feature request. Get back a tested PR. The planner decomposes your task into stories. Each story gets implemented, verified, and tested in isolation. Failures retry automatically. Nothing ships without a code review.</p>
           <div class="wf-pipeline">
@@ -132,8 +134,8 @@
           <p>Each agent gets a clean session. No context window bloat. No hallucinated state from 50 messages ago.</p>
         </div>
         <div class="step-card">
-          <h3>Retry and escalate</h3>
-          <p>Failed steps retry automatically. If retries exhaust, it escalates to you. Nothing fails silently.</p>
+          <h3>Automatic retries</h3>
+          <p>Failed steps retry automatically with configurable limits per step. The medic watches for stuck agents and cleans up abandoned work.</p>
         </div>
       </div>
     </section>
@@ -285,6 +287,8 @@
           <div class="cmd-row"><code>antfarm workflow status &lt;query&gt;</code><span>Check run status</span></div>
           <div class="cmd-row"><code>antfarm workflow runs</code><span>List all runs</span></div>
           <div class="cmd-row"><code>antfarm workflow resume &lt;run-id&gt;</code><span>Resume a failed run</span></div>
+          <div class="cmd-row"><code>antfarm workflow stop &lt;run-id&gt;</code><span>Cancel a running workflow</span></div>
+          <div class="cmd-row"><code>antfarm workflow ensure-crons &lt;id&gt;</code><span>Recreate crons after idle teardown</span></div>
         </div>
         <div class="cmd-group">
           <h4>Management</h4>

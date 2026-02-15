@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { loadWorkflowSpec } from "./workflow-spec.js";
 import { resolveWorkflowDir } from "./paths.js";
-import { getDb } from "../db.js";
+import { getDb, nextRunNumber } from "../db.js";
 import { logger } from "../lib/logger.js";
 import { ensureWorkflowCrons } from "./agent-cron.js";
 import { emitEvent } from "./events.js";
@@ -27,12 +27,13 @@ export async function runWorkflow(params: {
   taskTitle: string;
   notifyUrl?: string;
   allowConcurrent?: boolean;
-}): Promise<{ id: string; workflowId: string; task: string; status: string }> {
+}): Promise<{ id: string; runNumber: number; workflowId: string; task: string; status: string }> {
   const workflowDir = resolveWorkflowDir(params.workflowId);
   const workflow = await loadWorkflowSpec(workflowDir);
   const db = getDb();
   const now = new Date().toISOString();
   const runId = crypto.randomUUID();
+  const runNumber = nextRunNumber();
 
   if (!params.allowConcurrent) {
     const activeRun = db.prepare(
@@ -141,9 +142,9 @@ export async function runWorkflow(params: {
   try {
     const notifyUrl = params.notifyUrl ?? workflow.notifications?.url ?? null;
     const insertRun = db.prepare(
-      "INSERT INTO runs (id, workflow_id, task, status, context, notify_url, created_at, updated_at) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)"
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, notify_url, created_at, updated_at) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)"
     );
-    insertRun.run(runId, workflow.id, params.taskTitle, JSON.stringify(initialContext), notifyUrl, now, now);
+    insertRun.run(runId, runNumber, workflow.id, params.taskTitle, JSON.stringify(initialContext), notifyUrl, now, now);
 
     const insertStep = db.prepare(
       "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -152,7 +153,7 @@ export async function runWorkflow(params: {
     for (let i = 0; i < workflow.steps.length; i++) {
       const step = workflow.steps[i];
       const stepUuid = crypto.randomUUID();
-      const agentId = `${workflow.id}/${step.agent}`;
+      const agentId = `${workflow.id}_${step.agent}`;
       const status = i === 0 ? "pending" : "waiting";
       const maxRetries = step.max_retries ?? step.on_fail?.max_retries ?? 2;
       const stepType = step.type ?? "single";
@@ -179,11 +180,11 @@ export async function runWorkflow(params: {
 
   emitEvent({ ts: new Date().toISOString(), event: "run.started", runId, workflowId: workflow.id });
 
-  await logger.info(`Run started: "${params.taskTitle}"`, {
+  logger.info(`Run started: "${params.taskTitle}"`, {
     workflowId: workflow.id,
     runId,
     stepId: workflow.steps[0]?.id,
   });
 
-  return { id: runId, workflowId: workflow.id, task: params.taskTitle, status: "running" };
+  return { id: runId, runNumber, workflowId: workflow.id, task: params.taskTitle, status: "running" };
 }

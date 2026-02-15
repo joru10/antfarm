@@ -16,13 +16,14 @@ import { uninstallAntfarmSkill } from "./skill-install.js";
 import { removeAgentCrons } from "./agent-cron.js";
 import { deleteAgentCronJobs } from "./gateway-api.js";
 import { getDb } from "../db.js";
+import { stopDaemon } from "../server/daemonctl.js";
 import type { WorkflowInstallResult } from "./types.js";
 
 function filterAgentList(
   list: Array<Record<string, unknown>>,
   workflowId: string,
 ): Array<Record<string, unknown>> {
-  const prefix = `${workflowId}/`;
+  const prefix = `${workflowId}_`;
   return list.filter((entry) => {
     const id = typeof entry.id === "string" ? entry.id : "";
     return !id.startsWith(prefix);
@@ -37,6 +38,14 @@ async function pathExists(filePath: string): Promise<boolean> {
     return false;
   }
 }
+
+const DEFAULT_CRON_SESSION_RETENTION = "24h";
+const DEFAULT_SESSION_MAINTENANCE = {
+  mode: "enforce",
+  pruneAfter: "7d",
+  maxEntries: 500,
+  rotateBytes: "10mb",
+} as const;
 
 function getActiveRuns(workflowId?: string): Array<{ id: string; workflow_id: string; task: string }> {
   try {
@@ -109,16 +118,11 @@ export async function uninstallWorkflow(params: {
     if (!agentDir) {
       continue;
     }
-    if (await pathExists(agentDir)) {
-      await fs.rm(agentDir, { recursive: true, force: true });
-    }
-    // Also remove the parent directory if it's now empty
+    // Remove the entire parent directory (e.g. ~/.openclaw/agents/bug-fix_triager/)
+    // since both agent/ and sessions/ inside it are antfarm-managed
     const parentDir = path.dirname(agentDir);
     if (await pathExists(parentDir)) {
-      const remaining = await fs.readdir(parentDir).catch(() => ["placeholder"]);
-      if (remaining.length === 0) {
-        await fs.rm(parentDir, { recursive: true, force: true });
-      }
+      await fs.rm(parentDir, { recursive: true, force: true });
     }
   }
 
@@ -126,11 +130,17 @@ export async function uninstallWorkflow(params: {
 }
 
 export async function uninstallAllWorkflows(): Promise<void> {
+  // Stop the dashboard daemon before cleaning up files
+  stopDaemon();
+
   const { path: configPath, config } = await readOpenClawConfig();
   const list = Array.isArray(config.agents?.list) ? config.agents?.list : [];
   const removedAgents = list.filter((entry) => {
     const id = typeof entry.id === "string" ? entry.id : "";
-    return id.includes("/");
+    // Identify antfarm-managed agents: they have agentDir under ~/.openclaw/agents/
+    // and id is not "main" (the user's default agent)
+    const agentDir = typeof entry.agentDir === "string" ? entry.agentDir : "";
+    return id !== "main" && agentDir.includes("/.openclaw/agents/");
   });
   if (config.agents) {
     config.agents.list = list.filter((entry) => !removedAgents.includes(entry));
@@ -141,6 +151,27 @@ export async function uninstallAllWorkflows(): Promise<void> {
       .map((entry) => (typeof entry.id === "string" ? entry.id : ""))
       .filter(Boolean),
   );
+  if (config.cron?.sessionRetention === DEFAULT_CRON_SESSION_RETENTION) {
+    delete config.cron.sessionRetention;
+    if (Object.keys(config.cron).length === 0) {
+      delete config.cron;
+    }
+  }
+  if (config.session?.maintenance) {
+    const maintenance = config.session.maintenance;
+    const matchesDefaults =
+      maintenance.mode === DEFAULT_SESSION_MAINTENANCE.mode &&
+      (maintenance.pruneAfter === DEFAULT_SESSION_MAINTENANCE.pruneAfter ||
+        maintenance.pruneDays === undefined) &&
+      maintenance.maxEntries === DEFAULT_SESSION_MAINTENANCE.maxEntries &&
+      maintenance.rotateBytes === DEFAULT_SESSION_MAINTENANCE.rotateBytes;
+    if (matchesDefaults) {
+      delete config.session.maintenance;
+      if (Object.keys(config.session).length === 0) {
+        delete config.session;
+      }
+    }
+  }
   await writeOpenClawConfig(configPath, config);
 
   await removeMainAgentGuidance();
@@ -178,22 +209,25 @@ export async function uninstallAllWorkflows(): Promise<void> {
     if (!agentDir) {
       continue;
     }
-    if (await pathExists(agentDir)) {
-      await fs.rm(agentDir, { recursive: true, force: true });
-    }
-    // Also remove the parent directory if it's now empty
+    // Remove the entire parent directory (e.g. ~/.openclaw/agents/bug-fix_triager/)
+    // since both agent/ and sessions/ inside it are antfarm-managed
     const parentDir = path.dirname(agentDir);
     if (await pathExists(parentDir)) {
-      const remaining = await fs.readdir(parentDir).catch(() => ["placeholder"]);
-      if (remaining.length === 0) {
-        await fs.rm(parentDir, { recursive: true, force: true });
-      }
+      await fs.rm(parentDir, { recursive: true, force: true });
     }
   }
 
   const antfarmRoot = resolveAntfarmRoot();
   if (await pathExists(antfarmRoot)) {
-    const entries = await fs.readdir(antfarmRoot).catch(() => [] as string[]);
+    // Clean up remaining runtime files (dashboard.pid, dashboard.log, events.jsonl, logs/)
+    for (const name of ["dashboard.pid", "dashboard.log", "events.jsonl", "logs"]) {
+      const p = path.join(antfarmRoot, name);
+      if (await pathExists(p)) {
+        await fs.rm(p, { recursive: true, force: true });
+      }
+    }
+    // Remove the directory if now empty
+    const entries = await fs.readdir(antfarmRoot).catch(() => ["placeholder"] as string[]);
     if (entries.length === 0) {
       await fs.rm(antfarmRoot, { recursive: true, force: true });
     }

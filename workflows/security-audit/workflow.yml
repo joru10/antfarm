@@ -8,6 +8,10 @@ description: |
   Setup creates the security branch. Fixer implements each fix with regression tests.
   Verifier confirms each fix. Tester runs final integration validation. PR agent creates the pull request.
 
+polling:
+  model: default
+  timeoutSeconds: 120
+
 agents:
   - id: scanner
     name: Scanner
@@ -239,7 +243,7 @@ steps:
       5. Run {{build_cmd}} to verify the build passes
       6. Run {{test_cmd}} to verify all tests pass
       7. Commit: fix(security): brief description
-      8. Append to progress.txt
+      8. Append to progress-{{run_id}}.txt
 
       Reply with:
       STATUS: done

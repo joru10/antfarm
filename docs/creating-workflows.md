@@ -96,7 +96,9 @@ agents:
   - id: my-agent            # Unique within this workflow
     name: My Agent           # Display name
     role: coding             # Controls tool access (see Agent Roles below)
+    timeoutSeconds: 900      # Optional: override the role's default timeout (seconds)
     description: What it does.
+    timeoutSeconds: 1800     # Optional: override isolated session timeout (seconds)
     workspace:
       baseDir: agents/my-agent
       files:                 # Workspace files provisioned for this agent
@@ -128,6 +130,8 @@ Roles control what tools each agent has access to during execution:
 | `pr` | Read + exec only — runs `gh pr create` | pr |
 | `scanning` | Read + exec + web search for CVE lookups, NO write | scanner |
 
+Each role has a default timeout (20 or 30 min depending on role). Set `timeoutSeconds` on an agent to override it.
+
 ### Step Definition
 
 ```yaml
@@ -147,6 +151,19 @@ steps:
     on_fail:                 # What to do when retries exhausted (optional)
       escalate_to: human     # Escalate to human
 ```
+
+### Agent Timeouts
+
+Antfarm runs workflow agents as isolated cron jobs in OpenClaw. You can override the
+per-agent session timeout with `timeoutSeconds` in the agent definition:
+
+```yaml
+agents:
+  - id: developer
+    timeoutSeconds: 3600
+```
+
+If omitted, Antfarm defaults to 30 minutes per agent session.
 
 ### Template Variables
 

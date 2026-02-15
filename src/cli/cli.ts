@@ -17,18 +17,17 @@ try {
 
 import { installWorkflow } from "../installer/install.js";
 import { uninstallAllWorkflows, uninstallWorkflow, checkActiveRuns } from "../installer/uninstall.js";
-import { getWorkflowStatus, listRuns } from "../installer/status.js";
+import { getWorkflowStatus, listRuns, stopWorkflow } from "../installer/status.js";
 import { runWorkflow } from "../installer/run.js";
 import { listBundledWorkflows } from "../installer/workflow-fetch.js";
-import { readRecentLogs, logger } from "../lib/logger.js";
-import { getRecentEvents, getRunEvents, type AntfarmEvent, emitEvent } from "../installer/events.js";
+import { readRecentLogs } from "../lib/logger.js";
+import { getRecentEvents, getRunEvents, type AntfarmEvent } from "../installer/events.js";
 import { startDaemon, stopDaemon, getDaemonStatus, isRunning } from "../server/daemonctl.js";
-import { claimStep, completeStep, failStep, getStories } from "../installer/step-ops.js";
+import { claimStep, completeStep, failStep, getStories, peekStep } from "../installer/step-ops.js";
 import { ensureCliSymlink } from "../installer/symlink.js";
-import { getDb } from "../db.js";
-import { listCronJobs } from "../installer/gateway-api.js";
-import { teardownWorkflowCronsIfIdle } from "../installer/agent-cron.js";
-import { execFileSync, execSync } from "node:child_process";
+import { runMedicCheck, getMedicStatus, getRecentMedicChecks } from "../medic/medic.js";
+import { installMedicCron, uninstallMedicCron, isMedicCronInstalled } from "../medic/medic-cron.js";
+import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -49,25 +48,6 @@ function getVersion(): string {
 function formatEventTime(ts: string): string {
   const d = new Date(ts);
   return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true });
-}
-
-const DEFAULT_STALE_ACTIVE_RUN_MINUTES = 120;
-
-function parseUtcTimestamp(value: string | null | undefined): number {
-  if (!value) return 0;
-  if (value.includes("T")) return Date.parse(value);
-  return Date.parse(value.replace(" ", "T") + "Z");
-}
-
-function getStaleThresholdMs(minutesOverride?: number): number {
-  if (minutesOverride && Number.isFinite(minutesOverride) && minutesOverride > 0) {
-    return Math.floor(minutesOverride * 60_000);
-  }
-  const raw = process.env.ANTFARM_STALE_ACTIVE_RUN_MINUTES;
-  if (!raw) return DEFAULT_STALE_ACTIVE_RUN_MINUTES * 60_000;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_STALE_ACTIVE_RUN_MINUTES * 60_000;
-  return Math.floor(parsed * 60_000);
 }
 
 function formatEventLabel(evt: AntfarmEvent): string {
@@ -94,7 +74,7 @@ function printEvents(events: AntfarmEvent[]): void {
   if (events.length === 0) { console.log("No events yet."); return; }
   for (const evt of events) {
     const time = formatEventTime(evt.ts);
-    const agent = evt.agentId ? `  ${evt.agentId.split("/").pop()}` : "";
+    const agent = evt.agentId ? `  ${evt.agentId.split("_").slice(-1)[0]}` : "";
     const label = formatEventLabel(evt);
     const story = evt.storyTitle ? ` — ${evt.storyTitle}` : "";
     const detail = evt.detail ? ` (${evt.detail})` : "";
@@ -113,23 +93,28 @@ function printUsage() {
       "antfarm workflow install <name>      Install a workflow",
       "antfarm workflow uninstall <name>    Uninstall a workflow (blocked if runs active)",
       "antfarm workflow uninstall --all     Uninstall all workflows (--force to override)",
-      "antfarm workflow run <name> <task>   Start a workflow run (--allow-concurrent to queue)",
+      "antfarm workflow run <name> <task>   Start a workflow run",
       "antfarm workflow status <query>      Check run status (task substring, run ID prefix)",
       "antfarm workflow runs                List all workflow runs",
       "antfarm workflow resume <run-id>     Resume a failed run from where it left off",
-      "antfarm workflow cleanup-stale [workflow-id] [--minutes N] [--dry-run]",
-      "                                    Fail stale running runs stuck with no active step progress",
+      "antfarm workflow stop <run-id>        Stop/cancel a running workflow",
+      "antfarm workflow ensure-crons <name>  Recreate agent crons for a workflow",
       "",
       "antfarm dashboard [start] [--port N]   Start dashboard daemon (default: 3333)",
       "antfarm dashboard stop                  Stop dashboard daemon",
       "antfarm dashboard status                Check dashboard status",
       "",
+      "antfarm step peek <agent-id>        Lightweight check for pending work (HAS_WORK or NO_WORK)",
       "antfarm step claim <agent-id>       Claim pending step, output resolved input as JSON",
       "antfarm step complete <step-id>      Complete step (reads output from stdin)",
       "antfarm step fail <step-id> <error>  Fail step with retry logic",
       "antfarm step stories <run-id>       List stories for a run",
       "",
-      "antfarm probe <agent-id>             Show scheduler + queue readiness for one agent",
+      "antfarm medic install                Install medic watchdog cron",
+      "antfarm medic uninstall              Remove medic cron",
+      "antfarm medic run                    Run medic check now (manual trigger)",
+      "antfarm medic status                 Show medic health summary",
+      "antfarm medic log [<count>]          Show recent medic check history",
       "",
       "antfarm logs [<lines>]               Show recent activity (from events)",
       "antfarm logs <run-id>                Show activity for a specific run",
@@ -286,7 +271,91 @@ async function main() {
     return;
   }
 
+  if (group === "medic") {
+    if (action === "install") {
+      const result = await installMedicCron();
+      if (result.ok) {
+        console.log("Medic watchdog installed (checks every 5 minutes).");
+      } else {
+        console.error(`Failed to install medic: ${result.error}`);
+        process.exit(1);
+      }
+      return;
+    }
+
+    if (action === "uninstall") {
+      const result = await uninstallMedicCron();
+      if (result.ok) {
+        console.log("Medic watchdog removed.");
+      } else {
+        console.error(`Failed to uninstall medic: ${result.error}`);
+        process.exit(1);
+      }
+      return;
+    }
+
+    if (action === "run") {
+      const result = await runMedicCheck();
+      if (result.issuesFound === 0) {
+        console.log(`All clear — no issues found (${result.checkedAt})`);
+      } else {
+        console.log(`Medic check complete: ${result.summary}`);
+        console.log("");
+        for (const f of result.findings) {
+          const icon = f.severity === "critical" ? "!!!" : f.severity === "warning" ? " ! " : "   ";
+          const fix = f.remediated ? " [FIXED]" : "";
+          console.log(`  ${icon} ${f.message}${fix}`);
+        }
+      }
+      return;
+    }
+
+    if (action === "status") {
+      const status = getMedicStatus();
+      const cronInstalled = await isMedicCronInstalled();
+
+      console.log("Antfarm Medic");
+      console.log(`  Cron: ${cronInstalled ? "installed (every 5 min)" : "not installed"}`);
+
+      if (status.lastCheck) {
+        const ago = Math.round((Date.now() - new Date(status.lastCheck.checkedAt).getTime()) / 60000);
+        console.log(`  Last check: ${ago}min ago — ${status.lastCheck.summary}`);
+      } else {
+        console.log("  Last check: never");
+      }
+
+      console.log(`  Last 24h: ${status.recentChecks} checks, ${status.recentIssues} issues found, ${status.recentActions} auto-fixed`);
+      return;
+    }
+
+    if (action === "log") {
+      const limit = target ? parseInt(target, 10) || 20 : 20;
+      const checks = getRecentMedicChecks(limit);
+      if (checks.length === 0) {
+        console.log("No medic checks recorded yet.");
+        return;
+      }
+      for (const check of checks) {
+        const ts = new Date(check.checkedAt).toLocaleString("en-US", {
+          month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: true,
+        });
+        const icon = check.issuesFound > 0 ? (check.actionsTaken > 0 ? "~" : "X") : ".";
+        console.log(`  ${icon} ${ts} — ${check.summary}`);
+      }
+      return;
+    }
+
+    printUsage();
+    process.exit(1);
+  }
+
   if (group === "step") {
+    if (action === "peek") {
+      if (!target) { process.stderr.write("Missing agent-id.\n"); process.exit(1); }
+      const result = peekStep(target);
+      process.stdout.write(result + "\n");
+      return;
+    }
     if (action === "claim") {
       if (!target) { process.stderr.write("Missing agent-id.\n"); process.exit(1); }
       const result = claimStep(target);
@@ -347,161 +416,23 @@ async function main() {
       }
       return;
     }
+    // Also support "antfarm logs #3" to show events for run number 3
+    if (arg && /^#\d+$/.test(arg)) {
+      const runNum = parseInt(arg.slice(1), 10);
+      const db2 = (await import("../db.js")).getDb();
+      const r = db2.prepare("SELECT id FROM runs WHERE run_number = ?").get(runNum) as { id: string } | undefined;
+      if (r) {
+        const events = getRunEvents(r.id);
+        if (events.length === 0) { console.log(`No events for run #${runNum}.`); }
+        else { printEvents(events); }
+      } else {
+        console.log(`No run found with number #${runNum}.`);
+      }
+      return;
+    }
     const limit = parseInt(arg, 10) || 50;
     const events = getRecentEvents(limit);
     printEvents(events);
-    return;
-  }
-
-  if (group === "probe") {
-    const agentId = args[1];
-    const asJson = args.includes("--json");
-    if (!agentId) {
-      process.stderr.write("Missing agent-id.\n");
-      process.exit(1);
-    }
-
-    const db = getDb();
-    const pendingRows = db.prepare(
-      `SELECT s.run_id as runId, s.step_id as stepId, r.created_at as runCreatedAt, r.task as task
-       FROM steps s
-       JOIN runs r ON r.id = s.run_id
-       WHERE s.agent_id = ? AND s.status = 'pending' AND r.status = 'running'
-       ORDER BY r.created_at ASC, s.step_index ASC`
-    ).all(agentId) as Array<{ runId: string; stepId: string; runCreatedAt: string; task: string }>;
-
-    const runningRows = db.prepare(
-      `SELECT s.run_id as runId, s.step_id as stepId, r.created_at as runCreatedAt
-       FROM steps s
-       JOIN runs r ON r.id = s.run_id
-       WHERE s.agent_id = ? AND s.status = 'running' AND r.status = 'running'
-       ORDER BY r.created_at ASC, s.step_index ASC`
-    ).all(agentId) as Array<{ runId: string; stepId: string; runCreatedAt: string }>;
-
-    const workflowPrefix = agentId.includes("/") ? `antfarm/${agentId}` : `antfarm/${agentId}`;
-    let cron: {
-      found: boolean;
-      enabled?: boolean;
-      name?: string;
-      id?: string;
-      nextRunAt?: string;
-      lastRunAt?: string;
-      lastStatus?: string;
-      lastError?: string;
-      error?: string;
-    } = { found: false };
-
-    try {
-      const cronResult = await listCronJobs();
-      if (cronResult.ok && cronResult.jobs) {
-        const matched = cronResult.jobs.find((job) => job.name === workflowPrefix);
-        if (matched) {
-          const job = matched as any;
-          cron = {
-            found: true,
-            enabled: Boolean(job.enabled),
-            name: job.name,
-            id: job.id,
-            nextRunAt: typeof job.state?.nextRunAtMs === "number" ? new Date(job.state.nextRunAtMs).toISOString() : undefined,
-            lastRunAt: typeof job.state?.lastRunAtMs === "number" ? new Date(job.state.lastRunAtMs).toISOString() : undefined,
-            lastStatus: typeof job.state?.lastStatus === "string" ? job.state.lastStatus : undefined,
-            lastError: typeof job.state?.lastError === "string" ? job.state.lastError : undefined,
-          };
-        }
-      } else {
-        cron = { found: false, error: cronResult.error ?? "cron list failed" };
-      }
-    } catch (err) {
-      cron = { found: false, error: err instanceof Error ? err.message : String(err) };
-    }
-
-    // Probe fallback: direct OpenClaw CLI read for full cron state (helps when /tools/invoke list is partial).
-    if (!cron.found) {
-      try {
-        const raw = execFileSync(
-          "node",
-          ["/app/dist/index.js", "cron", "list", "--json"],
-          { encoding: "utf8", env: { ...process.env, OPENCLAW_GATEWAY_PORT: process.env.OPENCLAW_GATEWAY_PORT ?? "18789" } },
-        );
-        const parsed = JSON.parse(raw);
-        const jobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
-        const job = jobs.find((entry: any) => entry?.name === workflowPrefix);
-        if (job) {
-          cron = {
-            found: true,
-            enabled: Boolean(job.enabled),
-            name: job.name,
-            id: job.id,
-            nextRunAt: typeof job.state?.nextRunAtMs === "number" ? new Date(job.state.nextRunAtMs).toISOString() : undefined,
-            lastRunAt: typeof job.state?.lastRunAtMs === "number" ? new Date(job.state.lastRunAtMs).toISOString() : undefined,
-            lastStatus: typeof job.state?.lastStatus === "string" ? job.state.lastStatus : undefined,
-            lastError: typeof job.state?.lastError === "string" ? job.state.lastError : undefined,
-          };
-        }
-      } catch {
-        // Keep existing scheduler error state.
-      }
-    }
-
-    const report = {
-      agentId,
-      timestamp: new Date().toISOString(),
-      claimableNow: pendingRows.length > 0,
-      queueDepth: pendingRows.length,
-      runningCount: runningRows.length,
-      oldestPending: pendingRows[0]
-        ? {
-            runId: pendingRows[0].runId,
-            stepId: pendingRows[0].stepId,
-            runCreatedAt: pendingRows[0].runCreatedAt,
-            taskPreview: pendingRows[0].task.slice(0, 120),
-            aheadInQueue: 0,
-          }
-        : null,
-      upcomingQueue: pendingRows.slice(0, 10).map((row, index) => ({
-        queuePos: index + 1,
-        runId: row.runId,
-        stepId: row.stepId,
-        runCreatedAt: row.runCreatedAt,
-        taskPreview: row.task.slice(0, 120),
-      })),
-      scheduler: cron,
-    };
-
-    if (asJson) {
-      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
-      return;
-    }
-
-    const lines = [
-      `Agent: ${report.agentId}`,
-      `Time: ${report.timestamp}`,
-      `Claimable now: ${report.claimableNow ? "yes" : "no"}`,
-      `Queue depth: ${report.queueDepth}`,
-      `Currently running steps: ${report.runningCount}`,
-      "",
-      "Scheduler:",
-      `  Found: ${report.scheduler.found ? "yes" : "no"}`,
-      `  Name: ${report.scheduler.name ?? "-"}`,
-      `  Enabled: ${report.scheduler.enabled === undefined ? "-" : report.scheduler.enabled ? "yes" : "no"}`,
-      `  Next wake: ${report.scheduler.nextRunAt ?? "-"}`,
-      `  Last run: ${report.scheduler.lastRunAt ?? "-"}`,
-      `  Last status: ${report.scheduler.lastStatus ?? "-"}`,
-      `  Last error: ${report.scheduler.lastError ?? report.scheduler.error ?? "-"}`,
-      "",
-      "Queue (oldest first):",
-    ];
-    if (report.upcomingQueue.length === 0) {
-      lines.push("  (empty)");
-    } else {
-      for (const item of report.upcomingQueue) {
-        lines.push(`  #${item.queuePos} ${item.runId.slice(0, 8)} ${item.stepId} ${item.runCreatedAt} ${item.taskPreview}`);
-      }
-      if (report.queueDepth > report.upcomingQueue.length) {
-        lines.push(`  ... +${report.queueDepth - report.upcomingQueue.length} more`);
-      }
-    }
-    process.stdout.write(lines.join("\n") + "\n");
     return;
   }
 
@@ -513,7 +444,8 @@ async function main() {
     if (runs.length === 0) { console.log("No workflow runs found."); return; }
     console.log("Workflow runs:");
     for (const r of runs) {
-      console.log(`  [${r.status.padEnd(9)}] ${r.id.slice(0, 8)}  ${r.workflow_id.padEnd(14)}  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
+      const num = r.run_number != null ? `#${r.run_number}` : r.id.slice(0, 8);
+      console.log(`  [${r.status.padEnd(9)}] ${num.padEnd(6)} ${r.id.slice(0, 8)}  ${r.workflow_id.padEnd(14)}  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
     }
     return;
   }
@@ -527,144 +459,12 @@ async function main() {
     return;
   }
 
-  if (action === "cleanup-stale") {
-    const dryRun = args.includes("--dry-run");
-    const minutesIdx = args.indexOf("--minutes");
-    let minutesOverride: number | undefined;
-    if (minutesIdx !== -1) {
-      const raw = args[minutesIdx + 1];
-      const parsed = Number(raw);
-      if (!raw || !Number.isFinite(parsed) || parsed <= 0) {
-        process.stderr.write("Invalid --minutes value. Use a positive number.\n");
-        process.exit(1);
-      }
-      minutesOverride = parsed;
-    }
-
-    const workflowId = target && !target.startsWith("--") ? target : undefined;
-    const thresholdMs = getStaleThresholdMs(minutesOverride);
-    const nowMs = Date.now();
-    const thresholdMinutes = Math.floor(thresholdMs / 60_000);
-    const db = getDb();
-
-    const runs = db.prepare(
-      `SELECT id, workflow_id, task, created_at, updated_at
-       FROM runs
-       WHERE status = 'running'
-         AND (? IS NULL OR workflow_id = ?)
-       ORDER BY created_at ASC`
-    ).all(workflowId ?? null, workflowId ?? null) as Array<{
-      id: string;
-      workflow_id: string;
-      task: string;
-      created_at: string;
-      updated_at: string;
-    }>;
-
-    const staleRuns: Array<{
-      id: string;
-      workflowId: string;
-      task: string;
-      staleMinutes: number;
-      stepId: string | null;
-      agentId: string | null;
-    }> = [];
-
-    for (const run of runs) {
-      const stepMeta = db.prepare(
-        `SELECT
-           MAX(updated_at) AS max_updated_at,
-           SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running_steps
-         FROM steps
-         WHERE run_id = ?`
-      ).get(run.id) as { max_updated_at: string | null; running_steps: number | null };
-
-      const activeStep = db.prepare(
-        `SELECT step_id, agent_id
-         FROM steps
-         WHERE run_id = ? AND status IN ('pending', 'running')
-         ORDER BY step_index ASC
-         LIMIT 1`
-      ).get(run.id) as { step_id: string; agent_id: string } | undefined;
-
-      const lastActivityMs = Math.max(
-        parseUtcTimestamp(run.created_at),
-        parseUtcTimestamp(run.updated_at),
-        parseUtcTimestamp(stepMeta.max_updated_at),
-      );
-
-      if (lastActivityMs <= 0) continue;
-      const runningSteps = stepMeta.running_steps ?? 0;
-      const ageMs = nowMs - lastActivityMs;
-      if (runningSteps === 0 && ageMs > thresholdMs) {
-        staleRuns.push({
-          id: run.id,
-          workflowId: run.workflow_id,
-          task: run.task,
-          staleMinutes: Math.floor(ageMs / 60_000),
-          stepId: activeStep?.step_id ?? null,
-          agentId: activeStep?.agent_id ?? null,
-        });
-      }
-    }
-
-    if (staleRuns.length === 0) {
-      console.log(`No stale running runs found (threshold: ${thresholdMinutes}m).`);
-      return;
-    }
-
-    if (dryRun) {
-      console.log(`Dry run: ${staleRuns.length} stale run(s) would be failed (threshold: ${thresholdMinutes}m):`);
-      for (const run of staleRuns) {
-        const step = run.stepId ? `${run.stepId} (${run.agentId ?? "unknown-agent"})` : "none";
-        console.log(`  - ${run.id.slice(0, 8)}  ${run.workflowId}  stale=${run.staleMinutes}m  step=${step}  task=${run.task.slice(0, 80)}`);
-      }
-      return;
-    }
-
-    const cleanedWorkflows = new Set<string>();
-    const timestamp = new Date().toISOString();
-    db.exec("BEGIN");
-    try {
-      for (const run of staleRuns) {
-        const reason = `Cleanup-stale: auto-failed after ${run.staleMinutes} minutes without active step progress`;
-        db.prepare("UPDATE runs SET status = 'failed', updated_at = ? WHERE id = ? AND status = 'running'")
-          .run(timestamp, run.id);
-        db.prepare(
-          "UPDATE steps SET status = 'failed', output = COALESCE(output, ?), updated_at = ? WHERE run_id = ? AND status IN ('waiting','pending','running')"
-        ).run(reason, timestamp, run.id);
-        cleanedWorkflows.add(run.workflowId);
-      }
-      db.exec("COMMIT");
-    } catch (err) {
-      db.exec("ROLLBACK");
-      throw err;
-    }
-
-    for (const run of staleRuns) {
-      emitEvent({
-        ts: new Date().toISOString(),
-        event: "run.failed",
-        runId: run.id,
-        workflowId: run.workflowId,
-        detail: `Cleanup-stale failed run after ${run.staleMinutes} minutes of inactivity`,
-      });
-      await logger.warn("Cleanup-stale failed run", { workflowId: run.workflowId, runId: run.id });
-    }
-
-    for (const workflow of cleanedWorkflows) {
-      try {
-        await teardownWorkflowCronsIfIdle(workflow);
-      } catch {
-        // best-effort cleanup
-      }
-    }
-
-    console.log(`Cleaned ${staleRuns.length} stale run(s) (threshold: ${thresholdMinutes}m):`);
-    for (const run of staleRuns) {
-      const step = run.stepId ? `${run.stepId} (${run.agentId ?? "unknown-agent"})` : "none";
-      console.log(`  - ${run.id.slice(0, 8)}  ${run.workflowId}  stale=${run.staleMinutes}m  step=${step}`);
-    }
+  if (action === "stop") {
+    if (!target) { process.stderr.write("Missing run-id.\n"); printUsage(); process.exit(1); }
+    const result = await stopWorkflow(target);
+    if (result.status === "not_found") { process.stderr.write(result.message + "\n"); process.exit(1); }
+    if (result.status === "already_done") { process.stderr.write(result.message + "\n"); process.exit(1); }
+    console.log(`Cancelled run ${result.runId.slice(0, 8)} (${result.workflowId}). ${result.cancelledSteps} step(s) cancelled.`);
     return;
   }
 
@@ -699,8 +499,9 @@ async function main() {
     const result = getWorkflowStatus(query);
     if (result.status === "not_found") { process.stdout.write(`${result.message}\n`); return; }
     const { run, steps } = result;
+    const runLabel = run.run_number != null ? `#${run.run_number} (${run.id})` : run.id;
     const lines = [
-      `Run: ${run.id}`,
+      `Run: ${runLabel}`,
       `Workflow: ${run.workflow_id}`,
       `Task: ${run.task.slice(0, 120)}${run.task.length > 120 ? "..." : ""}`,
       `Status: ${run.status}`,
@@ -729,9 +530,18 @@ async function main() {
     const db = (await import("../db.js")).getDb();
 
     // Find the run (support prefix match)
-    const run = db.prepare(
-      "SELECT id, workflow_id, status FROM runs WHERE id = ? OR id LIKE ?"
-    ).get(target, `${target}%`) as { id: string; workflow_id: string; status: string } | undefined;
+    // Support run number lookup in addition to UUID prefix
+    let run: { id: string; run_number: number | null; workflow_id: string; status: string } | undefined;
+    if (/^\d+$/.test(target)) {
+      run = db.prepare(
+        "SELECT id, run_number, workflow_id, status FROM runs WHERE run_number = ?"
+      ).get(parseInt(target, 10)) as typeof run;
+    }
+    if (!run) {
+      run = db.prepare(
+        "SELECT id, run_number, workflow_id, status FROM runs WHERE id = ? OR id LIKE ?"
+      ).get(target, `${target}%`) as typeof run;
+    }
 
     if (!run) { process.stderr.write(`Run not found: ${target}\n`); process.exit(1); }
     if (run.status !== "failed") {
@@ -759,6 +569,9 @@ async function main() {
           "UPDATE stories SET status = 'pending', updated_at = datetime('now') WHERE id = ?"
         ).run(failedStory.id);
       }
+      db.prepare(
+        "UPDATE steps SET retry_count = 0 WHERE run_id = ? AND type = 'loop'"
+      ).run(run.id);
     }
 
     // Check if the failed step is a verify step linked to a loop step's verify_each
@@ -771,11 +584,11 @@ async function main() {
       if (lc.verifyEach && lc.verifyStep === failedStep.step_id) {
         // Reset the loop step (developer) to pending so it re-claims the story and populates context
         db.prepare(
-          "UPDATE steps SET status = 'pending', current_story_id = NULL, updated_at = datetime('now') WHERE id = ?"
+          "UPDATE steps SET status = 'pending', current_story_id = NULL, retry_count = 0, updated_at = datetime('now') WHERE id = ?"
         ).run(loopStep.id);
         // Reset verify step to waiting (fires after developer completes)
         db.prepare(
-          "UPDATE steps SET status = 'waiting', current_story_id = NULL, updated_at = datetime('now') WHERE id = ?"
+          "UPDATE steps SET status = 'waiting', current_story_id = NULL, retry_count = 0, updated_at = datetime('now') WHERE id = ?"
         ).run(failedStep.id);
         // Reset any failed stories to pending
         db.prepare(
@@ -806,7 +619,7 @@ async function main() {
 
     // Reset step to pending
     db.prepare(
-      "UPDATE steps SET status = 'pending', current_story_id = NULL, updated_at = datetime('now') WHERE id = ?"
+      "UPDATE steps SET status = 'pending', current_story_id = NULL, retry_count = 0, updated_at = datetime('now') WHERE id = ?"
     ).run(failedStep.id);
 
     // Reset run to running
@@ -830,25 +643,32 @@ async function main() {
     return;
   }
 
+  if (action === "ensure-crons") {
+    const { loadWorkflowSpec } = await import("../installer/workflow-spec.js");
+    const { resolveWorkflowDir } = await import("../installer/paths.js");
+    const { setupAgentCrons, removeAgentCrons } = await import("../installer/agent-cron.js");
+    const workflowDir = resolveWorkflowDir(target);
+    const workflow = await loadWorkflowSpec(workflowDir);
+    // Force recreate: remove existing then create fresh
+    await removeAgentCrons(target);
+    await setupAgentCrons(workflow);
+    console.log(`Recreated agent crons for workflow "${target}".`);
+    return;
+  }
+
   if (action === "run") {
     let notifyUrl: string | undefined;
-    let allowConcurrent = false;
     const runArgs = args.slice(3);
     const nuIdx = runArgs.indexOf("--notify-url");
     if (nuIdx !== -1) {
       notifyUrl = runArgs[nuIdx + 1];
       runArgs.splice(nuIdx, 2);
     }
-    const acIdx = runArgs.indexOf("--allow-concurrent");
-    if (acIdx !== -1) {
-      allowConcurrent = true;
-      runArgs.splice(acIdx, 1);
-    }
     const taskTitle = runArgs.join(" ").trim();
     if (!taskTitle) { process.stderr.write("Missing task title.\n"); printUsage(); process.exit(1); }
-    const run = await runWorkflow({ workflowId: target, taskTitle, notifyUrl, allowConcurrent });
+    const run = await runWorkflow({ workflowId: target, taskTitle, notifyUrl });
     process.stdout.write(
-      [`Run: ${run.id}`, `Workflow: ${run.workflowId}`, `Task: ${run.task}`, `Status: ${run.status}`].join("\n") + "\n",
+      [`Run: #${run.runNumber} (${run.id})`, `Workflow: ${run.workflowId}`, `Task: ${run.task}`, `Status: ${run.status}`].join("\n") + "\n",
     );
     return;
   }
