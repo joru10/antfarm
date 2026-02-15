@@ -55,6 +55,6 @@ export function resolveRunRoot(): string {
 }
 
 export function resolveAntfarmCli(): string {
-  // From dist/installer/paths.js -> ../../dist/cli/cli.js
-  return path.resolve(__dirname, "..", "cli", "cli.js");
+  // Resolve at runtime inside the agent shell environment so Docker/host paths both work.
+  return "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/workspace/antfarm/dist/cli/cli.js";
 }
