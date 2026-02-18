@@ -1,9 +1,9 @@
 id: morning-brief
 name: Morning Brief
-version: 1
+version: 2
 description: |
-  Daily morning intelligence brief with calendar, markets, news (2-source verified), 
-  and AI/data center updates. Runs at 07:30 CET.
+  Daily morning intelligence brief with structured data contracts.
+  Research -> compile -> verify gate. Designed for high-signal delivery.
 
 cron:
   interval_ms: 60000
@@ -21,31 +21,122 @@ agents:
   - id: news-agent
     name: News Fetcher
     role: testing
-    description: Fetches news from BBC, Wikipedia, France24 with 2-source verification
+    description: Fetches verified news/markets/AI-DC signals with timestamps and confidence tags
     workspace:
       baseDir: agents/news-agent
       files:
         AGENTS.md: agents/news-agent/AGENTS.md
 
+  - id: verifier
+    name: Brief Verifier
+    role: analysis
+    description: Validates freshness, structure, and confidence coverage before release
+    workspace:
+      baseDir: agents/verifier
+      files:
+        AGENTS.md: agents/verifier/AGENTS.md
+
 steps:
   - id: fetch-news
     agent: news-agent
     input: |
-      Fetch today's world news with 2-source verification.
+      Fetch today's intelligence data with 2-source verification and strict JSON shape.
+
+      ## HARD RULE
+      If browser automation fails, continue using non-browser sources. Workflow must complete with best-available data and explicit confidence tags.
       
-      WORKING SOURCES:
+      ## 1. WORLD NEWS (RSS feeds - use curl)
       - BBC RSS: curl -s https://feeds.bbci.co.uk/news/world/rss.xml
       - Wikipedia: curl -s https://r.jina.ai/http://en.wikipedia.org/wiki/Portal:Current_events  
       - France24: curl -s https://www.france24.com/en/rss
-      
       BLOCKED (451 errors): Reuters, Guardian, Al Jazeera
       
-      For each story, verify with 2+ sources and tag:
+      ## 2. MARKETS (MANDATORY non-browser first, search optional)
+      Goal: get S&P 500 current value today with cross-verification and timestamp.
+
+      Execution order (required):
+      1) Run non-browser free sources first (Yahoo JSON + Stooq CSV).
+      2) If Perplexity key exists, add search cross-check.
+      3) Browser is optional and MUST NOT be required for success.
+      4) Never run pip/pip3 install. If a command includes pip, skip it and continue.
+
+      ### 2A) If PERPLEXITY_API_KEY is set:
+      - Query: "S&P 500 current price today"
+      - Cross-check at least 2 of: MarketWatch, Yahoo Finance, Bloomberg
+      - Record:
+        - fetched_at (ISO-8601)
+        - source URLs used
+        - value + change
+        - confidence:
+          - verified (2+ independent sources agree)
+          - single_source (only one usable source)
+
+      ### 2B) If PERPLEXITY_API_KEY is NOT set:
+      Use free fallback path (no browser required, no package installs):
+      1) Primary endpoint: Yahoo Finance quote/chart JSON via curl (no yfinance):
+         - https://query1.finance.yahoo.com/v7/finance/quote?symbols=%5EGSPC
+         - https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=1d&interval=1m
+      2) Backup endpoint: Stooq CSV via curl:
+         - https://stooq.com/q/l/?s=%5Espx&i=d
+      3) Optional text corroboration: r.jina.ai mirrors for finance pages if reachable
+      4) Parse using built-in tools only (python3 stdlib, node, awk, jq if present).
+
+      HARD CONSTRAINTS:
+      - Do NOT run pip/pip3 install.
+      - Do NOT fail the full step because browser is unavailable.
+      - If only one reliable source works, continue with confidence=single_source.
+      - If every market endpoint fails, still return an index entry with source="fallback_unavailable", value="N/A", change="N/A", confidence="single_source" and include attempted source URLs in source_urls.
+      
+      ## 3. AI & DATA CENTER NEWS (RSS first, browser best-effort only)
+      Primary: Data Center Knowledge RSS or API
+      Fallback: Browser on failure only. If browser is unattached, continue with RSS/text sources and mark confidence accordingly.
+      - Data Center Knowledge: https://www.datacenterknowledge.com/
+      - TechCrunch AI: https://techcrunch.com/category/artificial-intelligence/
+      - Focus: AI power/energy, data center infrastructure, hyperscale builds
+      
+      For each story, verify with 2+ sources where possible and tag:
       ✅ confirmed (2+ sources)
       ⚠️ single source
+      ❓ unverified (no corroboration)
       
-      Include France focus stories.
-      Output: Brief news summary with confidence tags.
+      Recommended implementation strategy:
+      Keep Perplexity optional (best quality when key exists). Always include free fallback (Yahoo JSON endpoints + Stooq CSV + optional jina text) so report never stalls.
+      
+      CRITICAL: Save output to:
+      /home/node/.openclaw/workspace/briefs/hybrid/news-data.json
+      
+      Required structure (enforce per-item confidence in markets):
+      {
+        "date": "YYYY-MM-DD",
+        "generated_at": "ISO-8601",
+        "world_news": [{"headline": "...", "sources": [{"name":"BBC","url":"...","published":"YYYY-MM-DD"}], "confidence": "confirmed|single_source|unverified"}],
+        "markets": {
+          "captured_at":"ISO-8601",
+          "indices":[
+            {
+              "name":"S&P 500",
+              "value":"...",
+              "change":"...",
+              "captured_at":"ISO-8601",
+              "source":"yahoo|marketwatch|bloomberg",
+              "source_urls":["https://..."],
+              "confidence":"verified|single_source"
+            }
+          ],
+          "news":[...]
+        },
+        "ai_dc_news": [{"headline":"...","source":"...","published":"YYYY-MM-DD","confidence":"confirmed|single_source|unverified"}],
+        "france_focus": [{"headline":"...","source":"...","published":"YYYY-MM-DD","confidence":"confirmed|single_source|unverified"}]
+      }
+      
+      Hard requirements:
+      - Include publication dates for all non-market stories where available.
+      - Use confidence values exactly: confirmed, single_source, unverified.
+      - If evidence is weak, still include but mark unverified.
+      
+      After saving the file, reply:
+      STATUS: done
+      DATA_FILE: /home/node/.openclaw/workspace/briefs/hybrid/news-data.json
     expects: "STATUS: done"
     max_retries: 2
 
@@ -54,27 +145,183 @@ steps:
     input: |
       Compile the morning brief for {{date}}.
       
-      Format:
+      STEP 1: Read the news data file:
+      File: /home/node/.openclaw/workspace/briefs/hybrid/news-data.json
+      
+      STEP 2: Read calendar data:
+      File: /home/node/.openclaw/workspace/briefs/hybrid/calendar-today.json
+      
+      STEP 3: Read email data:
+      File: /home/node/.openclaw/workspace/briefs/hybrid/emails-overnight.json
+
+      STEP 3B (optional): Read topic signals mined from recent user questions:
+      File: /home/node/.openclaw/workspace/briefs/hybrid/topic-signals.json
+      - If present and `signals` has entries, include up to 2 concise additional sections.
+      - If missing/empty, continue normally (no failure).
+      
+      STEP 4: Compile the brief with this format:
+      
       ## Calendar Today
-      (from Outlook - note if unavailable)
+      - List meetings or state "No meetings"
       
-      ## Markets
-      (❓ unverified - no API keys)
+      ## 📧 Emails Overnight  
+      - List emails or state "No emails"
       
-      ## News & Geopolitics
-      - ✅ confirmed stories (2+ sources)
-      - ⚠️ single source stories
-      - France Focus section
+      ## 💹 Markets
+      - Use the markets data from news-data.json
+      - Include major indices and key market news
+      - Do NOT say "no API keys" — use fetched data from search/APIs/web fallbacks
       
-      ## AI & Data Center Infrastructure
-      (Check Data Center Knowledge, TechCrunch AI)
+      ## 🌍 News & Geopolitics
+      - Use world_news from news-data.json
+      - Tag: ✅ confirmed (2+ sources), ⚠️ single source
       
-      ## Data Quality Summary table
+      ## 🇫🇷 France Focus
+      - Use france_focus from news-data.json
       
-      Save to: briefs/morning-brief-{{date}}.md
+      ## 🤖 AI & Data Center Infrastructure
+      - Use ai_dc_news from news-data.json
+      - Do NOT say "no API keys" — use fetched data from search/APIs/web fallbacks
+
+      ## 🎯 Emerging Topics From Your Recent Questions (optional)
+      - Include only if topic-signals.json contains signals.
+      - Max 2 topics.
+      - For each topic: "why this is relevant now" + one next step.
+      - Keep it brief and practical.
+      
+      ## 📊 Data Quality Summary
+      - Table showing which sources were used
+      - Include confidence counts (confirmed / single_source / unverified)
+      - Include freshness notes (any stale data)
+      
+      STEP 5: Save the compiled brief to:
+      /home/node/.openclaw/workspace/briefs/morning-brief-{{date}}.md
+
+      STEP 6: Save verification metadata to:
+      /home/node/.openclaw/workspace/briefs/hybrid/morning-brief-draft.json
+      Required fields:
+      {
+        "date":"YYYY-MM-DD",
+        "brief_path":"...",
+        "news_data_path":"/home/node/.openclaw/workspace/briefs/hybrid/news-data.json",
+        "calendar_path":"/home/node/.openclaw/workspace/briefs/hybrid/calendar-today.json",
+        "emails_path":"/home/node/.openclaw/workspace/briefs/hybrid/emails-overnight.json",
+        "topic_signals_path":"/home/node/.openclaw/workspace/briefs/hybrid/topic-signals.json",
+        "included_topic_sections":0,
+        "quality":{"confirmed":0,"single_source":0,"unverified":0}
+      }
       
       Reply with:
       STATUS: done
       BRIEF_PATH: briefs/morning-brief-{{date}}.md
+      DRAFT_JSON: /home/node/.openclaw/workspace/briefs/hybrid/morning-brief-draft.json
     expects: "STATUS: done"
     max_retries: 2
+
+  - id: verify-brief
+    agent: verifier
+    input: |
+      Verify the morning brief package before release.
+
+      Read:
+      - /home/node/.openclaw/workspace/briefs/hybrid/news-data.json
+      - /home/node/.openclaw/workspace/briefs/hybrid/morning-brief-draft.json
+      - /home/node/.openclaw/workspace/briefs/morning-brief-{{date}}.md
+
+      Validate:
+      1) Required files exist and are parseable
+      2) date fields match {{date}}
+      3) world_news, markets, ai_dc_news, france_focus are present
+      4) confidence values use only confirmed|single_source|unverified
+      5) brief includes all required sections
+      6) stale data risks are explicitly called out if found
+      7) if topic-signals.json has non-empty signals, brief includes
+         "Emerging Topics From Your Recent Questions" section (max 2 topics)
+
+      If all checks pass, write:
+      /home/node/.openclaw/workspace/briefs/hybrid/morning-brief-verified.json
+      with:
+      {
+        "date":"YYYY-MM-DD",
+        "status":"verified",
+        "brief_path":"...",
+        "checked_at":"ISO-8601",
+        "issues":[]
+      }
+
+      If checks fail, write same file with:
+      - "status":"blocked"
+      - issues array populated with explicit reasons
+
+      Reply with:
+      STATUS: done
+      VERIFY_STATUS: verified|blocked
+      VERIFY_FILE: /home/node/.openclaw/workspace/briefs/hybrid/morning-brief-verified.json
+    expects: "STATUS: done"
+    max_retries: 2
+
+  - id: deliver-telegram
+    agent: coordinator
+    input: |
+      Deliver the verified morning brief to Telegram as a document.
+
+      Hard gate:
+      - Read /home/node/.openclaw/workspace/briefs/hybrid/morning-brief-verified.json
+      - Continue only if:
+        - status == "verified"
+        - date == {{date}}
+      - If gate fails, STOP and reply:
+        STATUS: blocked
+        REASON: verification_not_passed
+
+      Delivery command (run exactly):
+      ```bash
+      set -euo pipefail
+      VERIFY_FILE=/home/node/.openclaw/workspace/briefs/hybrid/morning-brief-verified.json
+      CHAT_ID=8217160607
+      TOKEN_FILE=/home/node/.openclaw/credentials/telegram-kate.token
+
+      if [ ! -f "$VERIFY_FILE" ]; then
+        echo "STATUS: blocked"
+        echo "REASON: verify_file_missing"
+        exit 0
+      fi
+
+      status=$(jq -r '.status // "missing"' "$VERIFY_FILE")
+      verify_date=$(jq -r '.date // ""' "$VERIFY_FILE")
+      if [ "$status" != "verified" ] || [ "$verify_date" != "{{date}}" ]; then
+        echo "STATUS: blocked"
+        echo "REASON: verification_not_passed"
+        exit 0
+      fi
+
+      BRIEF_PATH=$(jq -r '.brief_path // ""' "$VERIFY_FILE")
+      if [ -z "$BRIEF_PATH" ]; then
+        BRIEF_PATH="/home/node/.openclaw/workspace/briefs/morning-brief-{{date}}.md"
+      fi
+      if [ ! -f "$BRIEF_PATH" ]; then
+        echo "STATUS: blocked"
+        echo "REASON: brief_file_missing"
+        exit 0
+      fi
+      if [ ! -f "$TOKEN_FILE" ]; then
+        echo "STATUS: blocked"
+        echo "REASON: telegram_token_missing"
+        exit 0
+      fi
+
+      TOKEN=$(tr -d '\r\n' < "$TOKEN_FILE")
+      CAPTION="Morning brief {{date}} ✅ verified"
+      API_URL="https://api.telegram.org/bot${TOKEN}/sendDocument"
+
+      curl -fsS -X POST "$API_URL" \
+        -F "chat_id=${CHAT_ID}" \
+        -F "document=@${BRIEF_PATH}" \
+        -F "caption=${CAPTION}" >/tmp/morning-brief-telegram-send.json
+
+      echo "STATUS: done"
+      echo "DELIVERED_TO: ${CHAT_ID}"
+      echo "BRIEF_PATH: ${BRIEF_PATH}"
+      ```
+    expects: "STATUS: done"
+    max_retries: 1
