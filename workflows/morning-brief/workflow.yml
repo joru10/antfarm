@@ -140,6 +140,7 @@ steps:
     expects: "STATUS: done"
     max_retries: 2
 
+
   - id: compile-brief
     agent: coordinator
     input: |
@@ -164,12 +165,15 @@ steps:
       ## Calendar Today
       - List meetings or state "No meetings"
       
-      ## 📧 Emails Overnight  
+      ## 📧 Emails Overnight
       - List emails or state "No emails"
+      - Include email data freshness timestamp from emails-overnight.json
       
       ## 💹 Markets
       - Use the markets data from news-data.json
       - Include major indices and key market news
+      - Explicitly include coverage bullets for: US, Europe, Asia, FX, Crypto
+      - If one coverage area is unavailable, include "coverage gap" note in this section
       - Do NOT say "no API keys" — use fetched data from search/APIs/web fallbacks
       
       ## 🌍 News & Geopolitics
@@ -180,7 +184,11 @@ steps:
       - Use france_focus from news-data.json
       
       ## 🤖 AI & Data Center Infrastructure
-      - Use ai_dc_news from news-data.json
+      - Split into two subsections with explicit headings:
+        - ### AI Signals
+        - ### Data Center Infrastructure
+      - AI subsection must include at least one latent.space sourced item when available.
+      - Data Center subsection must be substantive (at least 2 bullets, not merged into AI bullets).
       - Do NOT say "no API keys" — use fetched data from search/APIs/web fallbacks
 
       ## 🎯 Emerging Topics From Your Recent Questions (optional)
@@ -208,7 +216,13 @@ steps:
         "emails_path":"/home/node/.openclaw/workspace/briefs/hybrid/emails-overnight.json",
         "topic_signals_path":"/home/node/.openclaw/workspace/briefs/hybrid/topic-signals.json",
         "included_topic_sections":0,
-        "quality":{"confirmed":0,"single_source":0,"unverified":0}
+        "quality":{"confirmed":0,"single_source":0,"unverified":0},
+        "acceptance":{
+          "email_fresh":false,
+          "markets_coverage":{"us":false,"europe":false,"asia":false,"fx":false,"crypto":false},
+          "latent_space_included":false,
+          "ai_dc_split_present":false
+        }
       }
       
       Reply with:
@@ -226,6 +240,7 @@ steps:
       Read:
       - /home/node/.openclaw/workspace/briefs/hybrid/news-data.json
       - /home/node/.openclaw/workspace/briefs/hybrid/morning-brief-draft.json
+      - /home/node/.openclaw/workspace/briefs/hybrid/emails-overnight.json
       - /home/node/.openclaw/workspace/briefs/morning-brief-{{date}}.md
 
       Validate:
@@ -238,6 +253,13 @@ steps:
       7) if topic-signals.json has non-empty signals, brief includes
          "Emerging Topics From Your Recent Questions" section (max 2 topics)
 
+      HARD ACCEPTANCE GATE (must pass to mark verified):
+      8) Email freshness: emails-overnight.json has fetched_at on {{date}} and no top-level error
+      9) Markets coverage: brief explicitly covers US + Europe + Asia + FX + Crypto
+      10) AI source requirement: latent.space appears in source list or AI subsection when available; if unavailable, issue must state latent.space_unavailable
+      11) AI/DC split: markdown contains distinct AI and Data Center subsections (not merged)
+      12) Freshness and confidence metadata are present in final brief summary
+
       If all checks pass, write:
       /home/node/.openclaw/workspace/briefs/hybrid/morning-brief-verified.json
       with:
@@ -246,11 +268,18 @@ steps:
         "status":"verified",
         "brief_path":"...",
         "checked_at":"ISO-8601",
+        "acceptance":{
+          "email_fresh":true,
+          "markets_coverage":{"us":true,"europe":true,"asia":true,"fx":true,"crypto":true},
+          "latent_space_included":true,
+          "ai_dc_split_present":true
+        },
         "issues":[]
       }
 
       If checks fail, write same file with:
       - "status":"blocked"
+      - acceptance object reflecting failed checks
       - issues array populated with explicit reasons
 
       Reply with:
@@ -265,47 +294,68 @@ steps:
     input: |
       Deliver the verified morning brief to Telegram as a document.
 
-      Hard gate:
-      - Read /home/node/.openclaw/workspace/briefs/hybrid/morning-brief-verified.json
-      - Continue only if:
-        - status == "verified"
-        - date == {{date}}
-      - If gate fails, STOP and reply:
-        STATUS: blocked
-        REASON: verification_not_passed
+      Promise contract behavior:
+      - Never stay silent on blocked delivery.
+      - If delivery gate fails, send a fail-open status message to chat with:
+        - what is missing
+        - what is already available
+        - exact ETA for retry
 
       Delivery command (run exactly):
       ```bash
       set -euo pipefail
       VERIFY_FILE=/home/node/.openclaw/workspace/briefs/hybrid/morning-brief-verified.json
+      BRIEF_FALLBACK=/home/node/.openclaw/workspace/briefs/morning-brief-{{date}}.md
       CHAT_ID=8217160607
       TOKEN_FILE=/home/node/.openclaw/credentials/telegram-kate.token
+      ETA_UTC=$(date -u -d '+20 minutes' +%FT%TZ 2>/dev/null || date -u -v+20M +%FT%TZ)
+
+      send_fail_open() {
+        reason="$1"
+        available="$2"
+        if [ ! -f "$TOKEN_FILE" ]; then
+          echo "STATUS: done"
+          echo "DELIVERY_STATUS: blocked"
+          echo "REASON: ${reason};telegram_token_missing"
+          return 0
+        fi
+        TOKEN=$(tr -d '\r\n' < "$TOKEN_FILE")
+        API_URL="https://api.telegram.org/bot${TOKEN}/sendMessage"
+        TEXT="⚠️ Morning brief delivery delayed ({{date}}). Missing: ${reason}. Available now: ${available}. Next ETA: ${ETA_UTC}."
+        curl -fsS -X POST "$API_URL" \
+          -d "chat_id=${CHAT_ID}" \
+          --data-urlencode "text=${TEXT}" >/tmp/morning-brief-telegram-failopen.json || true
+        echo "STATUS: done"
+        echo "DELIVERY_STATUS: fail_open_sent"
+        echo "REASON: ${reason}"
+      }
 
       if [ ! -f "$VERIFY_FILE" ]; then
-        echo "STATUS: blocked"
-        echo "REASON: verify_file_missing"
+        send_fail_open "verify_file_missing" "latest brief draft may still be compiling"
         exit 0
       fi
 
       status=$(jq -r '.status // "missing"' "$VERIFY_FILE")
       verify_date=$(jq -r '.date // ""' "$VERIFY_FILE")
+      issues=$(jq -r '(.issues // []) | .[:3] | join("; ")' "$VERIFY_FILE")
+      [ -n "$issues" ] || issues="none-listed"
+
       if [ "$status" != "verified" ] || [ "$verify_date" != "{{date}}" ]; then
-        echo "STATUS: blocked"
-        echo "REASON: verification_not_passed"
+        send_fail_open "verification_not_passed (${issues})" "verification artifact exists but not passed"
         exit 0
       fi
 
       BRIEF_PATH=$(jq -r '.brief_path // ""' "$VERIFY_FILE")
       if [ -z "$BRIEF_PATH" ]; then
-        BRIEF_PATH="/home/node/.openclaw/workspace/briefs/morning-brief-{{date}}.md"
+        BRIEF_PATH="$BRIEF_FALLBACK"
       fi
       if [ ! -f "$BRIEF_PATH" ]; then
-        echo "STATUS: blocked"
-        echo "REASON: brief_file_missing"
+        send_fail_open "brief_file_missing" "verification passed but brief file path is missing"
         exit 0
       fi
       if [ ! -f "$TOKEN_FILE" ]; then
-        echo "STATUS: blocked"
+        echo "STATUS: done"
+        echo "DELIVERY_STATUS: blocked"
         echo "REASON: telegram_token_missing"
         exit 0
       fi
@@ -320,6 +370,7 @@ steps:
         -F "caption=${CAPTION}" >/tmp/morning-brief-telegram-send.json
 
       echo "STATUS: done"
+      echo "DELIVERY_STATUS: delivered"
       echo "DELIVERED_TO: ${CHAT_ID}"
       echo "BRIEF_PATH: ${BRIEF_PATH}"
       ```
